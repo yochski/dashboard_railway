@@ -8,12 +8,20 @@ Sumber Data:
 Deploy: Railway
   - Set env var BPS_API_KEY di Railway dashboard
   - Upload data_trademap.xlsx dan bop_indonesia.db via Volume atau embed di repo
+
+FIXES (Railway):
+  - FETCH_TIMEOUT naik 120 → 300 detik
+  - REQUEST_TIMEOUT naik 10 → 20 detik
+  - MAX_WORKERS turun 12 → 6 (hindari rate limit BPS)
+  - Loop as_completed sekarang pakai try/except per-future
+    sehingga timeout 1 HS tidak menghentikan seluruh fetch
+  - Retry logic dipertahankan (total=3, backoff_factor=0.5)
 """
 
 import hashlib, requests, os, re, sqlite3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
 import pandas as pd
 from dash import Dash, dcc, html, Input, Output, State, dash_table
@@ -35,10 +43,12 @@ TM_XLSX     = os.path.join(DATA_DIR, os.environ.get("TM_XLSX_FILE", "data_tradem
 PORT        = int(os.environ.get("PORT", 8050))   # Railway inject PORT otomatis
 
 HS_ALL           = [str(i).zfill(2) for i in range(1, 100)]
-MAX_WORKERS      = int(os.environ.get("MAX_WORKERS", 12))
+
+# ── FIX: nilai default lebih aman untuk Railway ──────────────────
+MAX_WORKERS      = int(os.environ.get("MAX_WORKERS", 6))       # was 12
 CACHE_TTL        = int(os.environ.get("CACHE_TTL", 600))
-REQUEST_TIMEOUT  = 10
-FETCH_TIMEOUT    = 120
+REQUEST_TIMEOUT  = int(os.environ.get("REQUEST_TIMEOUT", 20))  # was 10
+FETCH_TIMEOUT    = int(os.environ.get("FETCH_TIMEOUT", 300))   # was 120
 
 TAHUN_SAAT_INI = datetime.now().year
 TAHUN_TERSEDIA = list(range(2015, TAHUN_SAAT_INI + 1))
@@ -163,7 +173,8 @@ def clean_hs(raw) -> str:
 # ─────────────────────────────────────────────────────────────────
 def _buat_session():
     s = requests.Session()
-    retry = Retry(total=3, backoff_factor=0.3,
+    # FIX: backoff_factor 0.3 → 0.5 agar retry lebih sabar di Railway
+    retry = Retry(total=3, backoff_factor=0.5,
                   status_forcelist=[429, 500, 502, 503, 504],
                   allowed_methods=["GET"])
     adp = HTTPAdapter(max_retries=retry,
@@ -227,14 +238,42 @@ def parse_rows(rows, kodehs_label=""):
     return out
 
 def fetch_all_bps(sumber, tahun, tipe, bulan=""):
-    semua = []
+    """
+    FIX utama: loop as_completed sekarang pakai try/except per-future.
+    Kalau 1 HS timeout di Railway, HS lainnya tetap dilanjutkan.
+    Sebelumnya: 1 TimeoutError langsung menghentikan seluruh generator.
+    """
+    semua        = []
+    hs_timeout   = []
+    hs_error     = []
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(fetch_one, sumber, hs, tahun, tipe, bulan): hs
                    for hs in HS_ALL}
-        for fut in as_completed(futures, timeout=FETCH_TIMEOUT):
-            rows = fut.result()
-            if rows:
-                semua.extend(parse_rows(rows, futures[fut]))
+        try:
+            for fut in as_completed(futures, timeout=FETCH_TIMEOUT):
+                hs = futures[fut]
+                try:
+                    rows = fut.result()
+                    if rows:
+                        semua.extend(parse_rows(rows, hs))
+                except FuturesTimeoutError:
+                    hs_timeout.append(hs)
+                except Exception as e:
+                    hs_error.append(hs)
+                    print(f"⚠️ Error HS {hs}: {e}")
+        except FuturesTimeoutError:
+            # FETCH_TIMEOUT keseluruhan habis — catat HS yang belum selesai
+            for fut, hs in futures.items():
+                if not fut.done():
+                    hs_timeout.append(hs)
+                    fut.cancel()
+
+    if hs_timeout:
+        print(f"⚠️ {len(hs_timeout)} HS timeout (tidak masuk data): {hs_timeout}")
+    if hs_error:
+        print(f"⚠️ {len(hs_error)} HS error: {hs_error}")
+
     return pd.DataFrame(semua) if semua else pd.DataFrame()
 
 def get_periode_params(pilihan):
