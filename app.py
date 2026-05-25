@@ -393,7 +393,6 @@ def get_kurs(tahun, periode):
 # ─────────────────────────────────────────────────────────────────
 def build_top15_xlsx(df_top15: pd.DataFrame, jenis: str, tahun: str,
                      unit_lbl: str, is_ekspor: bool) -> bytes:
-    """Buat file XLSX terformat untuk 15 komoditas terbesar."""
     wb = Workbook()
     ws = wb.active
     ws.title = f"Top15 {jenis}"
@@ -402,7 +401,6 @@ def build_top15_xlsx(df_top15: pd.DataFrame, jenis: str, tahun: str,
     thin_side  = Side(style="thin", color="D0D7DE")
     border_all = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
 
-    # ── Judul ─────────────────────────────────────────────────────
     ws.merge_cells("A1:F1")
     ws["A1"] = f"TOP 15 KOMODITAS {jenis.upper()} INDONESIA — TAHUN {tahun}"
     ws["A1"].font      = Font(bold=True, size=13, color="FFFFFF", name="Arial")
@@ -410,14 +408,12 @@ def build_top15_xlsx(df_top15: pd.DataFrame, jenis: str, tahun: str,
     ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 30
 
-    # ── Sub-judul sumber ──────────────────────────────────────────
     ws.merge_cells("A2:F2")
     ws["A2"] = f"Sumber: BPS API  |  Satuan: {unit_lbl}  |  Diunduh: {datetime.now().strftime('%d %b %Y %H:%M')}"
     ws["A2"].font      = Font(italic=True, size=9, color="6E7781", name="Arial")
     ws["A2"].alignment = Alignment(horizontal="center")
     ws.row_dimensions[2].height = 16
 
-    # ── Header kolom ──────────────────────────────────────────────
     headers = ["No", "Kode HS", "Deskripsi Komoditas", f"Nilai ({unit_lbl})", "Volume (kg)", "Share (%)"]
     for col_idx, h in enumerate(headers, 1):
         cell = ws.cell(row=3, column=col_idx, value=h)
@@ -427,7 +423,6 @@ def build_top15_xlsx(df_top15: pd.DataFrame, jenis: str, tahun: str,
         cell.border    = border_all
     ws.row_dimensions[3].height = 20
 
-    # ── Hitung share ──────────────────────────────────────────────
     total_val = df_top15["value"].sum()
 
     for i, row in enumerate(df_top15.itertuples(index=False), 1):
@@ -435,14 +430,8 @@ def build_top15_xlsx(df_top15: pd.DataFrame, jenis: str, tahun: str,
         nilai     = getattr(row, "value", 0)
         volume    = getattr(row, "berat", 0)
         share_pct = (nilai / total_val * 100) if total_val > 0 else 0
-        vals = [
-            i,
-            getattr(row, "kodehs", ""),
-            getattr(row, "deskripsi", ""),
-            nilai,
-            volume,
-            share_pct,
-        ]
+        vals = [i, getattr(row, "kodehs", ""), getattr(row, "deskripsi", ""),
+                nilai, volume, share_pct]
         for col_idx, v in enumerate(vals, 1):
             cell = ws.cell(row=i + 3, column=col_idx, value=v)
             cell.fill   = PatternFill("solid", start_color=fill_hex)
@@ -463,7 +452,6 @@ def build_top15_xlsx(df_top15: pd.DataFrame, jenis: str, tahun: str,
                 cell.value         = share_pct / 100
                 cell.alignment     = Alignment(horizontal="right")
 
-    # ── Baris total ───────────────────────────────────────────────
     total_row = len(df_top15) + 4
     ws.merge_cells(f"A{total_row}:C{total_row}")
     ws[f"A{total_row}"] = "TOTAL TOP 15"
@@ -473,9 +461,8 @@ def build_top15_xlsx(df_top15: pd.DataFrame, jenis: str, tahun: str,
 
     ws[f"D{total_row}"] = total_val
     ws[f"D{total_row}"].number_format = "#,##0.00"
-    ws[f"D{total_row}"].font = Font(bold=True, size=10, name="Arial")
-    ws[f"D{total_row}"].fill = PatternFill("solid", start_color=accent_hex)
     ws[f"D{total_row}"].font = Font(bold=True, color="FFFFFF", name="Arial")
+    ws[f"D{total_row}"].fill = PatternFill("solid", start_color=accent_hex)
     ws[f"D{total_row}"].alignment = Alignment(horizontal="right")
 
     ws[f"E{total_row}"] = df_top15["berat"].sum()
@@ -493,7 +480,6 @@ def build_top15_xlsx(df_top15: pd.DataFrame, jenis: str, tahun: str,
     for col_idx in range(1, 7):
         ws.cell(row=total_row, column=col_idx).border = border_all
 
-    # ── Lebar kolom ───────────────────────────────────────────────
     ws.column_dimensions["A"].width = 5
     ws.column_dimensions["B"].width = 10
     ws.column_dimensions["C"].width = 38
@@ -551,7 +537,6 @@ def _btn_download(btn_id, label, color="#1f6e3a"):
 
 def _card_header_with_downloads(title, btn_csv_id, btn_xlsx_id, dl_csv_id, dl_xlsx_id,
                                  csv_color="#1f6e3a", xlsx_color="#0969da"):
-    """Header kartu dengan judul kiri dan tombol download kanan."""
     return html.Div(
         style={"display":"flex","justifyContent":"space-between",
                "alignItems":"center","marginBottom":"12px"},
@@ -568,19 +553,24 @@ def _card_header_with_downloads(title, btn_csv_id, btn_xlsx_id, dl_csv_id, dl_xl
     )
 
 # ─────────────────────────────────────────────────────────────────
-#  LAYOUT
+#  APP INIT
+#  FIX #1: suppress_callback_exceptions=True mencegah error pada
+#           komponen yang belum ter-render saat halaman pertama load
 # ─────────────────────────────────────────────────────────────────
-app = Dash(__name__)
+app = Dash(__name__, suppress_callback_exceptions=True)
 server = app.server
 
 app.title = "Trade Intelligence | BPS · Trade Map · SEKI BI"
 
+# ─────────────────────────────────────────────────────────────────
+#  LAYOUT
+# ─────────────────────────────────────────────────────────────────
 app.layout = html.Div(id="main-container", children=[
 
     # ── Stores ──────────────────────────────────────────────────
     dcc.Store(id="theme-store", data="dark"),
     dcc.Store(id="store-bps"),
-    dcc.Store(id="store-top15"),   # menyimpan data top-15 komoditas
+    dcc.Store(id="store-top15"),
 
     # ── Header ──────────────────────────────────────────────────
     html.Div(id="hdr", style={"display":"flex","justifyContent":"space-between",
@@ -591,6 +581,8 @@ app.layout = html.Div(id="main-container", children=[
                       style={"fontSize":"16px"}),
         ]),
         html.Div(style={"display":"flex","gap":"15px","alignItems":"center"}, children=[
+            # FIX #2: id="ts" dimulai kosong — diisi oleh callback tick()
+            # setelah client ready, menghindari hydration mismatch
             html.Div(id="ts", style={"fontSize":"12px"}),
             html.Button("🌓 Tema", id="btn-theme",
                         style={"padding":"8px 16px","cursor":"pointer","fontFamily":FONT,
@@ -654,17 +646,14 @@ app.layout = html.Div(id="main-container", children=[
         dcc.Tab(label="📊 Ringkasan BPS", value="tab-ringkasan", id="tab-1", children=[
             html.Div(style={"paddingTop":"20px"}, children=[
 
-                # KPI cards
                 html.Div(id="kpi",
                          style={"display":"grid",
                                 "gridTemplateColumns":"repeat(auto-fit,minmax(200px,1fr))",
                                 "gap":"14px","marginBottom":"18px"}),
 
-                # Baris 1: Historis + Top Komoditas
                 html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr",
                                  "gap":"16px","marginBottom":"16px"}, children=[
 
-                    # Panel historis
                     html.Div(id="hist-card", children=[
                         html.Div(f"HISTORIS TREN ({TAHUN_TERSEDIA[0]}–{TAHUN_SAAT_INI})",
                                  style={"fontSize":"12px","fontWeight":"bold",
@@ -693,7 +682,6 @@ app.layout = html.Div(id="main-container", children=[
                                               style={"height":"350px"})),
                     ]),
 
-                    # Panel top komoditas (HS) + tombol download top-15
                     html.Div(id="chart-card-1", children=[
                         _card_header_with_downloads(
                             title        = "TOP 15 KOMODITAS (HS)",
@@ -706,7 +694,6 @@ app.layout = html.Div(id="main-container", children=[
                     ]),
                 ]),
 
-                # Baris 2: Top Negara + Share Pie
                 html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr",
                                  "gap":"16px"}, children=[
                     html.Div(id="chart-card-2", children=[
@@ -1034,8 +1021,16 @@ def apply_theme(tn):
             tbase, tsel, tbase, tsel, tbase, tsel, tbase, tsel, tbase, t5sel)
 
 
+# ─────────────────────────────────────────────────────────────────
+#  CALLBACK — TIMESTAMP
+#  FIX #2: Saat n_intervals=0 (render pertama / SSR), kembalikan
+#  string kosong agar server dan client menghasilkan HTML yang sama.
+#  Ini mencegah React hydration mismatch error #418 dan #423.
+# ─────────────────────────────────────────────────────────────────
 @app.callback(Output("ts","children"), Input("iv","n_intervals"))
-def tick(_):
+def tick(n):
+    if n == 0:
+        return ""
     return datetime.now().strftime("⏱ %d %b %Y  %H:%M")
 
 # ─────────────────────────────────────────────────────────────────
@@ -1064,7 +1059,7 @@ def cb_fetch_bps(_, tahun, periode, sumber):
         return {}, f"❌ Error BPS: {e}"
 
 # ─────────────────────────────────────────────────────────────────
-#  CALLBACKS — DASHBOARD BPS (termasuk store-top15)
+#  CALLBACKS — DASHBOARD BPS
 # ─────────────────────────────────────────────────────────────────
 @app.callback(
     [Output("store-top15","data"),
@@ -1113,7 +1108,6 @@ def update_bps(raw, neg_f, hs_f, unit, tn):
     ews  = calculate_ews(kmd.copy())
     full["deskripsi"] = full["kodehs"].map(HS_DESC).fillna("Lainnya")
 
-    # ── Simpan data top-15 ke store ───────────────────────────────
     top15 = kmd.head(15).copy()
     top15["deskripsi"] = top15["kodehs"].map(HS_DESC).fillna("Lainnya")
     top15_store = {
@@ -1454,7 +1448,6 @@ def download_top15_csv(_, store):
         "value":     f"Nilai ({lbl})",
         "berat":     "Volume (kg)",
     })
-    # Tambahkan kolom share
     total = df_out[f"Nilai ({lbl})"].sum()
     df_out["Share (%)"] = (df_out[f"Nilai ({lbl})"] / total * 100).round(2)
     df_out.insert(0, "No", range(1, len(df_out) + 1))
@@ -1606,7 +1599,6 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
             html.Div("Defisit < 0", style={"fontSize":"10px","color":t["muted"]}),
         ]))
 
-    # Chart: Transaksi Berjalan
     fig_ca = go.Figure()
     for iid, lbl_c, c in [
         (2,"Barang",t["green"]),(17,"Jasa",t["blue"]),
@@ -1626,7 +1618,6 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
                           legend=dict(orientation="h", yanchor="bottom", y=1.02,
                                       bgcolor="rgba(0,0,0,0)"))
 
-    # Chart: Waterfall
     wf_ids = [1, 26, 29, 47, 48]
     wf_lbl = ["Transaksi\nBerjalan","Transaksi\nModal",
                "Transaksi\nFinansial","Selisih\nPerhitungan","Neraca\nKeseluruhan"]
@@ -1646,7 +1637,6 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
     ))
     fig_wf.update_layout(**bc, height=340, showlegend=False, yaxis_title=lbl)
 
-    # Chart: Investasi
     fig_inv = go.Figure()
     for iid, lbl_i, c in [
         (32,"FDI",t["green"]),(35,"Portofolio",t["blue"]),
@@ -1667,7 +1657,6 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
                            legend=dict(orientation="h", yanchor="bottom", y=1.02,
                                        bgcolor="rgba(0,0,0,0)"))
 
-    # Chart: Cadangan Devisa
     fig_cad = go.Figure()
     s_cad = gs(54)
     s_ner = gs(48)
@@ -1693,7 +1682,6 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
                     bgcolor="rgba(0,0,0,0)"),
     )
 
-    # Chart: CA % PDB
     fig_pct = go.Figure()
     s_pct = df_all[df_all["item_id"] == 56].copy().sort_values("year")
     s_bln = df_all[df_all["item_id"] == 55].copy().sort_values("year")
@@ -1717,7 +1705,6 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
                     bgcolor="rgba(0,0,0,0)"),
     )
 
-    # Tabel
     if tbl_f:
         df_t = df_all[df_all["item_id"].isin(tbl_f)].copy()
     else:
