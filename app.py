@@ -8,6 +8,7 @@ Sumber Data:
 Deploy: Railway
   - Set env var BPS_API_KEY di Railway dashboard
   - Upload data_trademap.xlsx dan bop_indonesia.db via Volume atau embed di repo
+  - Start Command: gunicorn app:server --workers 2 --threads 4 --timeout 120
 """
 
 import hashlib, io, requests, os, re, sqlite3
@@ -36,9 +37,11 @@ TM_XLSX     = os.path.join(DATA_DIR, os.environ.get("TM_XLSX_FILE", "data_tradem
 PORT        = int(os.environ.get("PORT", 8050))
 
 HS_ALL           = [str(i).zfill(2) for i in range(1, 100)]
-MAX_WORKERS      = int(os.environ.get("MAX_WORKERS", 6))
+# REVISI 1: Turunkan MAX_WORKERS untuk mencegah Rate Limit BPS & OOM di Railway
+MAX_WORKERS      = int(os.environ.get("MAX_WORKERS", 3)) 
 CACHE_TTL        = int(os.environ.get("CACHE_TTL", 600))
-REQUEST_TIMEOUT  = int(os.environ.get("REQUEST_TIMEOUT", 20))
+# REVISI 2: Perpanjang timeout agar tidak cepat terputus
+REQUEST_TIMEOUT  = int(os.environ.get("REQUEST_TIMEOUT", 30))
 FETCH_TIMEOUT    = int(os.environ.get("FETCH_TIMEOUT", 300))
 
 TAHUN_SAAT_INI = datetime.now().year
@@ -110,7 +113,7 @@ BOP_MAIN_ITEMS = {
     40:"Derivatif Finansial", 41:"Investasi Lainnya",
     46:"Total (I+II+III)", 47:"Selisih Perhitungan",
     48:"Neraca Keseluruhan", 54:"Cadangan Devisa",
-    56:"CA % PDB",
+    55:"Cadangan Devisa (Bulan Impor)", 56:"CA % PDB",
 }
 BOP_DD_OPTIONS = [{"label": v, "value": k} for k, v in BOP_MAIN_ITEMS.items()]
 
@@ -164,8 +167,8 @@ def clean_hs(raw) -> str:
 # ─────────────────────────────────────────────────────────────────
 def _buat_session():
     s = requests.Session()
-    retry = Retry(total=3, backoff_factor=0.5,
-                  status_forcelist=[429, 500, 502, 503, 504],
+    retry = Retry(total=4, backoff_factor=1,
+                  status_forcelist=[429, 403, 500, 502, 503, 504],
                   allowed_methods=["GET"])
     adp = HTTPAdapter(max_retries=retry,
                       pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS + 4)
@@ -201,13 +204,17 @@ def fetch_one(sumber, kodehs, tahun, tipe, bulan=""):
     if hit is not None:
         return hit
     try:
-        r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+        # Menambahkan User-Agent agar tidak dicurigai sebagai bot otomatis
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        r = SESSION.get(url, timeout=REQUEST_TIMEOUT, headers=headers)
         r.raise_for_status()
         raw = r.json().get("data", [])
         result = raw if isinstance(raw, list) else []
         _cache_set(ckey, result)
         return result
-    except Exception:
+    except Exception as e:
+        # REVISI 3: Print error asli agar muncul di logs Railway
+        print(f"❌ Error API BPS (HS {kodehs}): {e}") 
         return []
 
 def parse_rows(rows, kodehs_label=""):
@@ -246,7 +253,6 @@ def fetch_all_bps(sumber, tahun, tipe, bulan=""):
                     hs_timeout.append(hs)
                 except Exception as e:
                     hs_error.append(hs)
-                    print(f"⚠️ Error HS {hs}: {e}")
         except FuturesTimeoutError:
             for fut, hs in futures.items():
                 if not fut.done():
@@ -256,7 +262,7 @@ def fetch_all_bps(sumber, tahun, tipe, bulan=""):
     if hs_timeout:
         print(f"⚠️ {len(hs_timeout)} HS timeout: {hs_timeout}")
     if hs_error:
-        print(f"⚠️ {len(hs_error)} HS error: {hs_error}")
+        print(f"⚠️ {len(hs_error)} HS error processing: {hs_error}")
 
     return pd.DataFrame(semua) if semua else pd.DataFrame()
 
@@ -305,7 +311,8 @@ def bop_query(sql, params=()):
         df   = pd.read_sql_query(sql, conn, params=params)
         conn.close()
         return df
-    except Exception:
+    except Exception as e:
+        print(f"❌ Database error: {e}")
         return pd.DataFrame()
 
 def bop_years():
@@ -373,7 +380,7 @@ def calculate_ews(df):
 
 KURS_HIST = {
     "2015":13389,"2016":13307,"2017":13384,"2018":14236,"2019":14147,
-    "2020":14582,"2021":14311,"2022":14850,"2023":15255,"2024":15700,"2025":15850,
+    "2020":14582,"2021":14311,"2022":14850,"2023":15255,"2024":15700,"2025":15850,"2026":16000,
 }
 
 def get_kurs(tahun, periode):
@@ -554,8 +561,6 @@ def _card_header_with_downloads(title, btn_csv_id, btn_xlsx_id, dl_csv_id, dl_xl
 
 # ─────────────────────────────────────────────────────────────────
 #  APP INIT
-#  FIX #1: suppress_callback_exceptions=True mencegah error pada
-#           komponen yang belum ter-render saat halaman pertama load
 # ─────────────────────────────────────────────────────────────────
 app = Dash(__name__, suppress_callback_exceptions=True)
 server = app.server
@@ -581,8 +586,6 @@ app.layout = html.Div(id="main-container", children=[
                       style={"fontSize":"16px"}),
         ]),
         html.Div(style={"display":"flex","gap":"15px","alignItems":"center"}, children=[
-            # FIX #2: id="ts" dimulai kosong — diisi oleh callback tick()
-            # setelah client ready, menghindari hydration mismatch
             html.Div(id="ts", style={"fontSize":"12px"}),
             html.Button("🌓 Tema", id="btn-theme",
                         style={"padding":"8px 16px","cursor":"pointer","fontFamily":FONT,
@@ -626,7 +629,7 @@ app.layout = html.Div(id="main-container", children=[
                       dcc.RadioItems(id="radio-unit",
                                      options=[{"label":" USD","value":1},
                                               {"label":" Miliar USD","value":1e9}],
-                                     value=1, inline=True,
+                                     value=1e9, inline=True,
                                      labelStyle={"marginRight":"15px","cursor":"pointer",
                                                  "color":"inherit","fontWeight":"bold"})]),
             html.Button("▶ MUAT BPS", id="btn-load-bps",
@@ -832,7 +835,7 @@ app.layout = html.Div(id="main-container", children=[
                 html.Div(id="seki-db-badge", style={"marginBottom":"14px"}),
 
                 html.Div(id="seki-filter-card", children=[
-                    html.Div("3. NERACA PEMBAYARAN — SEKI BANK INDONESIA (2004–2025)",
+                    html.Div("3. NERACA PEMBAYARAN — SEKI BANK INDONESIA (2004–2026)",
                              style={"fontSize":"10px","letterSpacing":"2px",
                                     "marginBottom":"14px","fontWeight":"bold"}),
                     html.Div(style={"display":"grid",
@@ -847,7 +850,7 @@ app.layout = html.Div(id="main-container", children=[
                                   dcc.Dropdown(id="seki-y2",
                                                options=[{"label":str(y),"value":y}
                                                         for y in _BOP_YEARS],
-                                               value=_BOP_YEARS[-1],
+                                               value=_BOP_YEARS[-1] if _BOP_YEARS else 2026,
                                                clearable=False, style=_dd)]),
                         html.Div([html.Label("Frekuensi", style={"fontSize":"11px"}),
                                   dcc.RadioItems(id="seki-freq",
@@ -863,7 +866,7 @@ app.layout = html.Div(id="main-container", children=[
                                   dcc.RadioItems(id="seki-unit",
                                                  options=[{"label":" Juta USD","value":1},
                                                           {"label":" Miliar USD","value":1000}],
-                                                 value=1, inline=True,
+                                                 value=1000, inline=True,
                                                  labelStyle={"marginRight":"12px",
                                                              "color":"inherit",
                                                              "fontWeight":"bold"})]),
@@ -934,6 +937,7 @@ app.layout = html.Div(id="main-container", children=[
                                   style={"height":"320px"}),
                     ]),
                     html.Div(id="seki-c6", children=[
+                        # Pastikan label ini sesuai standar Bappenas
                         html.Div("CURRENT ACCOUNT % PDB & CADDEV (BULAN IMPOR)",
                                  style={"fontSize":"10px","fontWeight":"bold",
                                         "marginBottom":"8px"}),
@@ -1021,12 +1025,6 @@ def apply_theme(tn):
             tbase, tsel, tbase, tsel, tbase, tsel, tbase, tsel, tbase, t5sel)
 
 
-# ─────────────────────────────────────────────────────────────────
-#  CALLBACK — TIMESTAMP
-#  FIX #2: Saat n_intervals=0 (render pertama / SSR), kembalikan
-#  string kosong agar server dan client menghasilkan HTML yang sama.
-#  Ini mencegah React hydration mismatch error #418 dan #423.
-# ─────────────────────────────────────────────────────────────────
 @app.callback(Output("ts","children"), Input("iv","n_intervals"))
 def tick(n):
     if n == 0:
@@ -1049,7 +1047,7 @@ def cb_fetch_bps(_, tahun, periode, sumber):
     try:
         df = fetch_all_bps(sumber, tahun, tipe, bulan)
         if df.empty:
-            return {}, f"⚠️ Tidak ada data BPS {jenis} {tahun}."
+            return {}, f"⚠️ Tidak ada data BPS {jenis} {tahun}. Periksa Deploy Logs jika terjadi timeout/blokir."
         return (
             {"data": df.to_dict("records"), "sumber": sumber,
              "tahun": tahun, "periode": periode},
@@ -1274,7 +1272,7 @@ def cb_mirroring(_, mitra, tahun, sumber, unit, tn):
 
     df_bps_all = fetch_all_bps(sumber, tahun, tipe, bulan)
     if df_bps_all.empty:
-        return _empty(f"⚠️ Tidak ada data BPS {tahun}. Coba muat ulang.")
+        return _empty(f"⚠️ Tidak ada data BPS {tahun}. Periksa log Railway.")
 
     mitra_norm = normalize_negara(mitra)
     df_bps = df_bps_all[df_bps_all["negara"] == mitra_norm].copy()
@@ -1692,7 +1690,7 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
                           for v in s_pct["value_mn_usd"]], opacity=0.9))
     if not s_bln.empty:
         fig_pct.add_trace(go.Scatter(
-            x=s_bln[xcol], y=s_bln["value_mn_usd"], name="Caddev (Bln Impor)",
+            x=s_bln[xcol], y=s_bln["value_mn_usd"], name="Caddev (Bulan Impor)",
             mode="lines+markers", line=dict(color=t["yellow"], width=2),
             marker=dict(size=5), yaxis="y2"))
     fig_pct.add_hline(y=0, line_dash="dash", line_color=t["muted"], line_width=1)
