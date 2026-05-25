@@ -8,47 +8,38 @@ Sumber Data:
 Deploy: Railway
   - Set env var BPS_API_KEY di Railway dashboard
   - Upload data_trademap.xlsx dan bop_indonesia.db via Volume atau embed di repo
-
-FIXES (Railway):
-  - FETCH_TIMEOUT naik 120 → 300 detik
-  - REQUEST_TIMEOUT naik 10 → 20 detik
-  - MAX_WORKERS turun 12 → 6 (hindari rate limit BPS)
-  - Loop as_completed sekarang pakai try/except per-future
-    sehingga timeout 1 HS tidak menghentikan seluruh fetch
-  - Retry logic dipertahankan (total=3, backoff_factor=0.5)
 """
 
-import hashlib, requests, os, re, sqlite3
+import hashlib, io, requests, os, re, sqlite3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from dash import Dash, dcc, html, Input, Output, State, dash_table
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime
 
 # ─────────────────────────────────────────────────────────────────
-#  KONFIGURASI UTAMA  (Railway: set env var BPS_API_KEY)
+#  KONFIGURASI UTAMA
 # ─────────────────────────────────────────────────────────────────
 API_KEY_BPS  = os.environ.get("BPS_API_KEY", "c390bc3265694cce3a446082f9747178")
 BASE_URL_BPS = "https://webapi.bps.go.id/v1/api/dataexim"
 
-# Railway Volume / file paths — sesuaikan jika pakai persistent volume
 DATA_DIR    = os.environ.get("DATA_DIR", os.path.dirname(__file__))
 BOP_DB_PATH = os.path.join(DATA_DIR, os.environ.get("BOP_DB_FILE", "bop_indonesia.db"))
 TM_XLSX     = os.path.join(DATA_DIR, os.environ.get("TM_XLSX_FILE", "data_trademap.xlsx"))
 
-PORT        = int(os.environ.get("PORT", 8050))   # Railway inject PORT otomatis
+PORT        = int(os.environ.get("PORT", 8050))
 
 HS_ALL           = [str(i).zfill(2) for i in range(1, 100)]
-
-# ── FIX: nilai default lebih aman untuk Railway ──────────────────
-MAX_WORKERS      = int(os.environ.get("MAX_WORKERS", 6))       # was 12
+MAX_WORKERS      = int(os.environ.get("MAX_WORKERS", 6))
 CACHE_TTL        = int(os.environ.get("CACHE_TTL", 600))
-REQUEST_TIMEOUT  = int(os.environ.get("REQUEST_TIMEOUT", 20))  # was 10
-FETCH_TIMEOUT    = int(os.environ.get("FETCH_TIMEOUT", 300))   # was 120
+REQUEST_TIMEOUT  = int(os.environ.get("REQUEST_TIMEOUT", 20))
+FETCH_TIMEOUT    = int(os.environ.get("FETCH_TIMEOUT", 300))
 
 TAHUN_SAAT_INI = datetime.now().year
 TAHUN_TERSEDIA = list(range(2015, TAHUN_SAAT_INI + 1))
@@ -173,7 +164,6 @@ def clean_hs(raw) -> str:
 # ─────────────────────────────────────────────────────────────────
 def _buat_session():
     s = requests.Session()
-    # FIX: backoff_factor 0.3 → 0.5 agar retry lebih sabar di Railway
     retry = Retry(total=3, backoff_factor=0.5,
                   status_forcelist=[429, 500, 502, 503, 504],
                   allowed_methods=["GET"])
@@ -238,14 +228,9 @@ def parse_rows(rows, kodehs_label=""):
     return out
 
 def fetch_all_bps(sumber, tahun, tipe, bulan=""):
-    """
-    FIX utama: loop as_completed sekarang pakai try/except per-future.
-    Kalau 1 HS timeout di Railway, HS lainnya tetap dilanjutkan.
-    Sebelumnya: 1 TimeoutError langsung menghentikan seluruh generator.
-    """
-    semua        = []
-    hs_timeout   = []
-    hs_error     = []
+    semua      = []
+    hs_timeout = []
+    hs_error   = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(fetch_one, sumber, hs, tahun, tipe, bulan): hs
@@ -263,14 +248,13 @@ def fetch_all_bps(sumber, tahun, tipe, bulan=""):
                     hs_error.append(hs)
                     print(f"⚠️ Error HS {hs}: {e}")
         except FuturesTimeoutError:
-            # FETCH_TIMEOUT keseluruhan habis — catat HS yang belum selesai
             for fut, hs in futures.items():
                 if not fut.done():
                     hs_timeout.append(hs)
                     fut.cancel()
 
     if hs_timeout:
-        print(f"⚠️ {len(hs_timeout)} HS timeout (tidak masuk data): {hs_timeout}")
+        print(f"⚠️ {len(hs_timeout)} HS timeout: {hs_timeout}")
     if hs_error:
         print(f"⚠️ {len(hs_error)} HS error: {hs_error}")
 
@@ -359,7 +343,6 @@ def bop_latest_val(item_id):
                       ORDER BY year DESC, quarter DESC LIMIT 1""", (item_id,))
     return float(df["value_mn_usd"].iloc[0]) if not df.empty else None
 
-# ── startup ──────────────────────────────────────────────────────
 _BOP_OK     = bop_ok()
 _BOP_YEARS  = bop_years() if _BOP_OK else list(range(2004, 2026))
 _BOP_LATEST = bop_latest() if _BOP_OK else "-"
@@ -406,6 +389,124 @@ def get_kurs(tahun, periode):
     return k, f"KURS USD/IDR (RATA-RATA {lbl.upper()} {tahun})"
 
 # ─────────────────────────────────────────────────────────────────
+#  XLSX EXPORT HELPER — TOP 15 KOMODITAS
+# ─────────────────────────────────────────────────────────────────
+def build_top15_xlsx(df_top15: pd.DataFrame, jenis: str, tahun: str,
+                     unit_lbl: str, is_ekspor: bool) -> bytes:
+    """Buat file XLSX terformat untuk 15 komoditas terbesar."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"Top15 {jenis}"
+
+    accent_hex = "1F6E3A" if is_ekspor else "0969DA"
+    thin_side  = Side(style="thin", color="D0D7DE")
+    border_all = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+    # ── Judul ─────────────────────────────────────────────────────
+    ws.merge_cells("A1:F1")
+    ws["A1"] = f"TOP 15 KOMODITAS {jenis.upper()} INDONESIA — TAHUN {tahun}"
+    ws["A1"].font      = Font(bold=True, size=13, color="FFFFFF", name="Arial")
+    ws["A1"].fill      = PatternFill("solid", start_color=accent_hex)
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    # ── Sub-judul sumber ──────────────────────────────────────────
+    ws.merge_cells("A2:F2")
+    ws["A2"] = f"Sumber: BPS API  |  Satuan: {unit_lbl}  |  Diunduh: {datetime.now().strftime('%d %b %Y %H:%M')}"
+    ws["A2"].font      = Font(italic=True, size=9, color="6E7781", name="Arial")
+    ws["A2"].alignment = Alignment(horizontal="center")
+    ws.row_dimensions[2].height = 16
+
+    # ── Header kolom ──────────────────────────────────────────────
+    headers = ["No", "Kode HS", "Deskripsi Komoditas", f"Nilai ({unit_lbl})", "Volume (kg)", "Share (%)"]
+    for col_idx, h in enumerate(headers, 1):
+        cell = ws.cell(row=3, column=col_idx, value=h)
+        cell.font      = Font(bold=True, color="FFFFFF", size=10, name="Arial")
+        cell.fill      = PatternFill("solid", start_color="2D333B")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border    = border_all
+    ws.row_dimensions[3].height = 20
+
+    # ── Hitung share ──────────────────────────────────────────────
+    total_val = df_top15["value"].sum()
+
+    for i, row in enumerate(df_top15.itertuples(index=False), 1):
+        fill_hex  = "F6F8FA" if i % 2 == 0 else "FFFFFF"
+        nilai     = getattr(row, "value", 0)
+        volume    = getattr(row, "berat", 0)
+        share_pct = (nilai / total_val * 100) if total_val > 0 else 0
+        vals = [
+            i,
+            getattr(row, "kodehs", ""),
+            getattr(row, "deskripsi", ""),
+            nilai,
+            volume,
+            share_pct,
+        ]
+        for col_idx, v in enumerate(vals, 1):
+            cell = ws.cell(row=i + 3, column=col_idx, value=v)
+            cell.fill   = PatternFill("solid", start_color=fill_hex)
+            cell.border = border_all
+            cell.font   = Font(name="Arial", size=10)
+            if col_idx == 1:
+                cell.alignment = Alignment(horizontal="center")
+            elif col_idx == 3:
+                cell.alignment = Alignment(horizontal="left")
+            elif col_idx == 4:
+                cell.number_format = "#,##0.00"
+                cell.alignment     = Alignment(horizontal="right")
+            elif col_idx == 5:
+                cell.number_format = "#,##0"
+                cell.alignment     = Alignment(horizontal="right")
+            elif col_idx == 6:
+                cell.number_format = "0.0%"
+                cell.value         = share_pct / 100
+                cell.alignment     = Alignment(horizontal="right")
+
+    # ── Baris total ───────────────────────────────────────────────
+    total_row = len(df_top15) + 4
+    ws.merge_cells(f"A{total_row}:C{total_row}")
+    ws[f"A{total_row}"] = "TOTAL TOP 15"
+    ws[f"A{total_row}"].font      = Font(bold=True, size=10, color="FFFFFF", name="Arial")
+    ws[f"A{total_row}"].fill      = PatternFill("solid", start_color=accent_hex)
+    ws[f"A{total_row}"].alignment = Alignment(horizontal="center")
+
+    ws[f"D{total_row}"] = total_val
+    ws[f"D{total_row}"].number_format = "#,##0.00"
+    ws[f"D{total_row}"].font = Font(bold=True, size=10, name="Arial")
+    ws[f"D{total_row}"].fill = PatternFill("solid", start_color=accent_hex)
+    ws[f"D{total_row}"].font = Font(bold=True, color="FFFFFF", name="Arial")
+    ws[f"D{total_row}"].alignment = Alignment(horizontal="right")
+
+    ws[f"E{total_row}"] = df_top15["berat"].sum()
+    ws[f"E{total_row}"].number_format = "#,##0"
+    ws[f"E{total_row}"].font = Font(bold=True, color="FFFFFF", name="Arial")
+    ws[f"E{total_row}"].fill = PatternFill("solid", start_color=accent_hex)
+    ws[f"E{total_row}"].alignment = Alignment(horizontal="right")
+
+    ws[f"F{total_row}"] = 1.0
+    ws[f"F{total_row}"].number_format = "0.0%"
+    ws[f"F{total_row}"].font = Font(bold=True, color="FFFFFF", name="Arial")
+    ws[f"F{total_row}"].fill = PatternFill("solid", start_color=accent_hex)
+    ws[f"F{total_row}"].alignment = Alignment(horizontal="right")
+
+    for col_idx in range(1, 7):
+        ws.cell(row=total_row, column=col_idx).border = border_all
+
+    # ── Lebar kolom ───────────────────────────────────────────────
+    ws.column_dimensions["A"].width = 5
+    ws.column_dimensions["B"].width = 10
+    ws.column_dimensions["C"].width = 38
+    ws.column_dimensions["D"].width = 20
+    ws.column_dimensions["E"].width = 18
+    ws.column_dimensions["F"].width = 12
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+# ─────────────────────────────────────────────────────────────────
 #  TEMA & CHART HELPERS
 # ─────────────────────────────────────────────────────────────────
 THEMES = {
@@ -437,25 +538,57 @@ def empty_fig(t, msg="Klik MUAT DATA untuk memulai"):
     return fig
 
 # ─────────────────────────────────────────────────────────────────
+#  LAYOUT HELPERS
+# ─────────────────────────────────────────────────────────────────
+_dd = {"color": "#000"}
+
+def _btn_download(btn_id, label, color="#1f6e3a"):
+    return html.Button(label, id=btn_id,
+                       style={"padding":"6px 14px","cursor":"pointer","fontWeight":"bold",
+                              "backgroundColor":color,"color":"#ffffff",
+                              "border":"none","borderRadius":"4px",
+                              "fontFamily":FONT,"fontSize":"11px"})
+
+def _card_header_with_downloads(title, btn_csv_id, btn_xlsx_id, dl_csv_id, dl_xlsx_id,
+                                 csv_color="#1f6e3a", xlsx_color="#0969da"):
+    """Header kartu dengan judul kiri dan tombol download kanan."""
+    return html.Div(
+        style={"display":"flex","justifyContent":"space-between",
+               "alignItems":"center","marginBottom":"12px"},
+        children=[
+            html.Div(title, style={"fontSize":"10px","fontWeight":"bold",
+                                   "letterSpacing":"1px"}),
+            html.Div(style={"display":"flex","gap":"8px","alignItems":"center"}, children=[
+                _btn_download(btn_csv_id,  "⬇ CSV",  csv_color),
+                _btn_download(btn_xlsx_id, "⬇ XLSX", xlsx_color),
+                dcc.Download(id=dl_csv_id),
+                dcc.Download(id=dl_xlsx_id),
+            ]),
+        ],
+    )
+
+# ─────────────────────────────────────────────────────────────────
 #  LAYOUT
 # ─────────────────────────────────────────────────────────────────
 app = Dash(__name__)
-server = app.server  # Expose Flask server for gunicorn
+server = app.server
 
 app.title = "Trade Intelligence | BPS · Trade Map · SEKI BI"
 
-_dd = {"color": "#000"}
-
 app.layout = html.Div(id="main-container", children=[
+
+    # ── Stores ──────────────────────────────────────────────────
     dcc.Store(id="theme-store", data="dark"),
     dcc.Store(id="store-bps"),
+    dcc.Store(id="store-top15"),   # menyimpan data top-15 komoditas
 
     # ── Header ──────────────────────────────────────────────────
     html.Div(id="hdr", style={"display":"flex","justifyContent":"space-between",
                                "alignItems":"center","marginBottom":"20px"}, children=[
         html.Div([
             html.Span("NEXOS | ", style={"fontWeight":"bold","fontSize":"18px"}),
-            html.Span("BPS · ITC Trade Map · SEKI Bank Indonesia", style={"fontSize":"16px"}),
+            html.Span("BPS · ITC Trade Map · SEKI Bank Indonesia",
+                      style={"fontSize":"16px"}),
         ]),
         html.Div(style={"display":"flex","gap":"15px","alignItems":"center"}, children=[
             html.Div(id="ts", style={"fontSize":"12px"}),
@@ -469,13 +602,17 @@ app.layout = html.Div(id="main-container", children=[
     # ── Filter BPS ──────────────────────────────────────────────
     html.Div(id="filter-card", children=[
         html.Div("1. KONTROL DATA BPS (API LIVE)",
-                 style={"fontSize":"10px","letterSpacing":"2px","marginBottom":"12px","fontWeight":"bold"}),
-        html.Div(style={"display":"grid","gridTemplateColumns":"repeat(auto-fit,minmax(150px,1fr))",
+                 style={"fontSize":"10px","letterSpacing":"2px",
+                        "marginBottom":"12px","fontWeight":"bold"}),
+        html.Div(style={"display":"grid",
+                         "gridTemplateColumns":"repeat(auto-fit,minmax(150px,1fr))",
                          "gap":"14px","alignItems":"end"}, children=[
             html.Div([html.Label("Tahun", style={"fontSize":"11px"}),
                       dcc.Dropdown(id="dd-tahun",
-                                   options=[{"label":str(t),"value":str(t)} for t in reversed(TAHUN_TERSEDIA)],
-                                   value=str(TAHUN_TERSEDIA[-2]), clearable=False, style=_dd)]),
+                                   options=[{"label":str(t),"value":str(t)}
+                                            for t in reversed(TAHUN_TERSEDIA)],
+                                   value=str(TAHUN_TERSEDIA[-2]),
+                                   clearable=False, style=_dd)]),
             html.Div([html.Label("Periode", style={"fontSize":"11px"}),
                       dcc.Dropdown(id="dd-periode", options=PERIODE_OPSI,
                                    value="tahunan", clearable=False, style=_dd)]),
@@ -487,7 +624,8 @@ app.layout = html.Div(id="main-container", children=[
                                      labelStyle={"marginRight":"15px","cursor":"pointer",
                                                  "color":"inherit","fontWeight":"bold"})]),
             html.Div([html.Label("Filter Negara", style={"fontSize":"11px"}),
-                      dcc.Dropdown(id="input-negara", placeholder="Semua Negara...", style=_dd)]),
+                      dcc.Dropdown(id="input-negara",
+                                   placeholder="Semua Negara...", style=_dd)]),
             html.Div([html.Label("Filter HS", style={"fontSize":"11px"}),
                       dcc.Dropdown(id="input-hs",
                                    options=[{"label":f"HS {h}","value":h} for h in HS_ALL],
@@ -506,69 +644,97 @@ app.layout = html.Div(id="main-container", children=[
         ]),
     ]),
 
-    html.Div(id="status-bps", style={"margin":"12px 0","fontSize":"12px","minHeight":"16px"}),
+    html.Div(id="status-bps",
+             style={"margin":"12px 0","fontSize":"12px","minHeight":"16px"}),
 
     # ── Tabs ────────────────────────────────────────────────────
     dcc.Tabs(id="tabs", value="tab-ringkasan", children=[
 
-        # TAB 1 — Ringkasan BPS
+        # ── TAB 1 — Ringkasan BPS ───────────────────────────────
         dcc.Tab(label="📊 Ringkasan BPS", value="tab-ringkasan", id="tab-1", children=[
             html.Div(style={"paddingTop":"20px"}, children=[
-                html.Div(id="kpi", style={"display":"grid",
-                                           "gridTemplateColumns":"repeat(auto-fit,minmax(200px,1fr))",
-                                           "gap":"14px","marginBottom":"18px"}),
+
+                # KPI cards
+                html.Div(id="kpi",
+                         style={"display":"grid",
+                                "gridTemplateColumns":"repeat(auto-fit,minmax(200px,1fr))",
+                                "gap":"14px","marginBottom":"18px"}),
+
+                # Baris 1: Historis + Top Komoditas
                 html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr",
                                  "gap":"16px","marginBottom":"16px"}, children=[
+
+                    # Panel historis
                     html.Div(id="hist-card", children=[
                         html.Div(f"HISTORIS TREN ({TAHUN_TERSEDIA[0]}–{TAHUN_SAAT_INI})",
-                                 style={"fontSize":"12px","fontWeight":"bold","marginBottom":"12px"}),
+                                 style={"fontSize":"12px","fontWeight":"bold",
+                                        "marginBottom":"12px"}),
                         html.Div(style={"display":"grid",
                                          "gridTemplateColumns":"repeat(auto-fit,minmax(130px,1fr))",
                                          "gap":"10px","marginBottom":"15px"}, children=[
                             dcc.Dropdown(id="hist-hs",
                                          options=[{"label":f"HS {h}","value":h} for h in HS_ALL],
                                          placeholder="Pilih HS spesifik...", style=_dd),
-                            dcc.Dropdown(id="hist-negara", placeholder="Semua Negara...", style=_dd),
+                            dcc.Dropdown(id="hist-negara",
+                                         placeholder="Semua Negara...", style=_dd),
                             dcc.RadioItems(id="hist-metric",
                                            options=[{"label":" Nilai","value":"nilai"},
                                                     {"label":" YoY %","value":"yoy"}],
                                            value="nilai", inline=True,
-                                           labelStyle={"marginRight":"10px","color":"inherit"}),
+                                           labelStyle={"marginRight":"10px",
+                                                       "color":"inherit"}),
                             html.Button("Tampilkan Histori", id="btn-hist",
                                         style={"padding":"8px","backgroundColor":"#e3b341",
                                                "border":"none","borderRadius":"4px",
                                                "fontWeight":"bold","cursor":"pointer"}),
                         ]),
-                        dcc.Loading(dcc.Graph(id="g-hist", config={"displayModeBar":False},
+                        dcc.Loading(dcc.Graph(id="g-hist",
+                                              config={"displayModeBar":False},
                                               style={"height":"350px"})),
                     ]),
+
+                    # Panel top komoditas (HS) + tombol download top-15
                     html.Div(id="chart-card-1", children=[
-                        html.Div("TOP KOMODITAS (HS)",
-                                 style={"fontSize":"10px","marginBottom":"12px","fontWeight":"bold"}),
+                        _card_header_with_downloads(
+                            title        = "TOP 15 KOMODITAS (HS)",
+                            btn_csv_id   = "btn-dl-top15-csv",
+                            btn_xlsx_id  = "btn-dl-top15-xlsx",
+                            dl_csv_id    = "dl-top15-csv",
+                            dl_xlsx_id   = "dl-top15-xlsx",
+                        ),
                         dcc.Graph(id="g-kmd", config={"displayModeBar":False}),
                     ]),
                 ]),
-                html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr","gap":"16px"}, children=[
+
+                # Baris 2: Top Negara + Share Pie
+                html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr",
+                                 "gap":"16px"}, children=[
                     html.Div(id="chart-card-2", children=[
-                        html.Div("TOP NEGARA MITRA", style={"fontSize":"10px","fontWeight":"bold"}),
+                        html.Div("TOP NEGARA MITRA",
+                                 style={"fontSize":"10px","fontWeight":"bold",
+                                        "marginBottom":"8px"}),
                         dcc.Graph(id="g-neg", config={"displayModeBar":False}),
                     ]),
                     html.Div(id="chart-card-3", children=[
-                        html.Div("SHARE KOMODITAS", style={"fontSize":"10px","fontWeight":"bold"}),
+                        html.Div("SHARE KOMODITAS",
+                                 style={"fontSize":"10px","fontWeight":"bold",
+                                        "marginBottom":"8px"}),
                         dcc.Graph(id="g-pie", config={"displayModeBar":False}),
                     ]),
                 ]),
             ]),
         ]),
 
-        # TAB 2 — Data Lengkap
+        # ── TAB 2 — Data Lengkap ────────────────────────────────
         dcc.Tab(label="🗄️ Data Lengkap BPS", value="tab-tabel", id="tab-2", children=[
             html.Div(id="table-card-full", style={"paddingTop":"20px"}, children=[
-                html.Div(style={"display":"flex","justifyContent":"flex-end","marginBottom":"10px"}, children=[
+                html.Div(style={"display":"flex","justifyContent":"flex-end",
+                                 "marginBottom":"10px"}, children=[
                     html.Button("⬇ Download CSV", id="btn-dl-bps",
-                                style={"padding":"8px 16px","cursor":"pointer","fontWeight":"bold",
-                                       "backgroundColor":"#1f6e3a","color":"#ffffff",
-                                       "border":"none","borderRadius":"4px","fontFamily":FONT}),
+                                style={"padding":"8px 16px","cursor":"pointer",
+                                       "fontWeight":"bold","backgroundColor":"#1f6e3a",
+                                       "color":"#ffffff","border":"none",
+                                       "borderRadius":"4px","fontFamily":FONT}),
                     dcc.Download(id="dl-bps"),
                 ]),
                 dash_table.DataTable(id="tabel-full", page_size=20,
@@ -576,25 +742,32 @@ app.layout = html.Div(id="main-container", children=[
             ]),
         ]),
 
-        # TAB 3 — EWS
+        # ── TAB 3 — EWS ─────────────────────────────────────────
         dcc.Tab(label="⚠️ Early Warning System", value="tab-ews", id="tab-3", children=[
             html.Div(id="ews-card", style={"paddingTop":"20px"}, children=[
-                html.Div("Deteksi anomali dengan Z-Score. Batas Atas = konsentrasi berlebih. "
+                html.Div("Deteksi anomali dengan Z-Score. "
+                         "Batas Atas = konsentrasi berlebih. "
                          "Batas Bawah = underperforming.",
-                         style={"fontSize":"11px","marginBottom":"15px","fontStyle":"italic"}),
+                         style={"fontSize":"11px","marginBottom":"15px",
+                                "fontStyle":"italic"}),
                 dash_table.DataTable(id="tabel-ews", page_size=15,
                                      sort_action="native", filter_action="native"),
                 html.Div("* Volume & Harga bergantung pada ketersediaan field berat/netto "
                          "di response API BPS.",
-                         style={"fontSize":"10px","fontStyle":"italic","marginTop":"10px","color":"#8b949e"}),
+                         style={"fontSize":"10px","fontStyle":"italic",
+                                "marginTop":"10px","color":"#8b949e"}),
             ]),
         ]),
 
-        # TAB 4 — Mirroring
-        dcc.Tab(label="🪞 Mirroring (BPS vs Trade Map)", value="tab-mirror", id="tab-4", children=[
+        # ── TAB 4 — Mirroring ───────────────────────────────────
+        dcc.Tab(label="🪞 Mirroring (BPS vs Trade Map)",
+                value="tab-mirror", id="tab-4", children=[
             html.Div(id="mirror-container", style={"paddingTop":"20px"}, children=[
-                html.Div(style={"background":"rgba(9,105,218,0.1)","border":"1px solid #0969da",
-                                 "padding":"15px","borderRadius":"8px","marginBottom":"20px"}, children=[
+
+                html.Div(style={"background":"rgba(9,105,218,0.1)",
+                                 "border":"1px solid #0969da",
+                                 "padding":"15px","borderRadius":"8px",
+                                 "marginBottom":"20px"}, children=[
                     html.Div("2. ANALISIS ASIMETRI PENCATATAN",
                              style={"fontSize":"11px","fontWeight":"bold",
                                     "marginBottom":"10px","color":"#0969da"}),
@@ -603,46 +776,59 @@ app.layout = html.Div(id="main-container", children=[
                                      "gap":"14px","alignItems":"end"}, children=[
                         html.Div([html.Label("Mitra Dagang", style={"fontSize":"11px"}),
                                   dcc.Dropdown(id="dd-mitra",
-                                               options=[{"label":k,"value":k} for k in PARTNER_LIST],
+                                               options=[{"label":k,"value":k}
+                                                        for k in PARTNER_LIST],
                                                placeholder="Pilih Negara...", style=_dd)]),
                         html.Div([html.Label("Satuan Mirroring", style={"fontSize":"11px"}),
                                   dcc.RadioItems(id="radio-unit-mirror",
                                                  options=[{"label":" USD","value":1},
                                                           {"label":" Juta USD","value":1e6}],
                                                  value=1e6, inline=True,
-                                                 labelStyle={"marginRight":"15px","cursor":"pointer",
-                                                             "color":"inherit","fontWeight":"bold"})]),
+                                                 labelStyle={"marginRight":"15px",
+                                                             "cursor":"pointer",
+                                                             "color":"inherit",
+                                                             "fontWeight":"bold"})]),
                         html.Button("▶ JALANKAN MIRRORING", id="btn-mirror",
-                                    style={"padding":"10px","cursor":"pointer","fontWeight":"bold",
+                                    style={"padding":"10px","cursor":"pointer",
+                                           "fontWeight":"bold",
                                            "backgroundColor":"#0969da","color":"#ffffff",
                                            "border":"none","borderRadius":"4px"}),
                     ]),
                 ]),
+
                 html.Div(id="status-mirror",
-                         style={"marginBottom":"16px","fontSize":"12px","fontWeight":"bold"}),
+                         style={"marginBottom":"16px","fontSize":"12px",
+                                "fontWeight":"bold"}),
                 html.Div(id="kpi-mirror",
                          style={"display":"grid",
                                 "gridTemplateColumns":"repeat(auto-fit,minmax(280px,1fr))",
                                 "gap":"14px","marginBottom":"18px"}),
+
                 html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr",
                                  "gap":"16px","marginBottom":"16px"}, children=[
                     html.Div(id="chart-mirror-1", children=[
                         html.Div("KOMPARASI BPS VS ITC TRADE MAP (10 HS TERBESAR BPS)",
-                                 style={"fontSize":"10px","marginBottom":"12px","fontWeight":"bold"}),
+                                 style={"fontSize":"10px","marginBottom":"12px",
+                                        "fontWeight":"bold"}),
                         dcc.Graph(id="g-compare", config={"displayModeBar":False}),
                     ]),
                     html.Div(id="chart-mirror-2", children=[
                         html.Div("5 HS ASIMETRI TERBESAR",
-                                 style={"fontSize":"10px","marginBottom":"12px","fontWeight":"bold"}),
+                                 style={"fontSize":"10px","marginBottom":"12px",
+                                        "fontWeight":"bold"}),
                         dcc.Graph(id="g-discrepancy", config={"displayModeBar":False}),
                     ]),
                 ]),
+
                 html.Div(id="table-card-mirror", children=[
-                    html.Div(style={"display":"flex","justifyContent":"flex-end","marginBottom":"10px"}, children=[
+                    html.Div(style={"display":"flex","justifyContent":"flex-end",
+                                     "marginBottom":"10px"}, children=[
                         html.Button("⬇ Download CSV", id="btn-dl-mirror",
-                                    style={"padding":"8px 16px","cursor":"pointer","fontWeight":"bold",
+                                    style={"padding":"8px 16px","cursor":"pointer",
+                                           "fontWeight":"bold",
                                            "backgroundColor":"#0969da","color":"#ffffff",
-                                           "border":"none","borderRadius":"4px","fontFamily":FONT}),
+                                           "border":"none","borderRadius":"4px",
+                                           "fontFamily":FONT}),
                         dcc.Download(id="dl-mirror"),
                     ]),
                     dash_table.DataTable(id="tabel-mirror", page_size=20,
@@ -651,8 +837,9 @@ app.layout = html.Div(id="main-container", children=[
             ]),
         ]),
 
-        # TAB 5 — NERACA PEMBAYARAN SEKI BANK INDONESIA
-        dcc.Tab(label="🏦 Neraca Pembayaran (SEKI BI)", value="tab-seki", id="tab-5", children=[
+        # ── TAB 5 — SEKI BI ─────────────────────────────────────
+        dcc.Tab(label="🏦 Neraca Pembayaran (SEKI BI)",
+                value="tab-seki", id="tab-5", children=[
             html.Div(style={"paddingTop":"20px"}, children=[
 
                 html.Div(id="seki-db-badge", style={"marginBottom":"14px"}),
@@ -666,28 +853,36 @@ app.layout = html.Div(id="main-container", children=[
                                      "gap":"14px","alignItems":"end"}, children=[
                         html.Div([html.Label("Tahun Awal", style={"fontSize":"11px"}),
                                   dcc.Dropdown(id="seki-y1",
-                                               options=[{"label":str(y),"value":y} for y in _BOP_YEARS],
+                                               options=[{"label":str(y),"value":y}
+                                                        for y in _BOP_YEARS],
                                                value=2015, clearable=False, style=_dd)]),
                         html.Div([html.Label("Tahun Akhir", style={"fontSize":"11px"}),
                                   dcc.Dropdown(id="seki-y2",
-                                               options=[{"label":str(y),"value":y} for y in _BOP_YEARS],
-                                               value=_BOP_YEARS[-1], clearable=False, style=_dd)]),
+                                               options=[{"label":str(y),"value":y}
+                                                        for y in _BOP_YEARS],
+                                               value=_BOP_YEARS[-1],
+                                               clearable=False, style=_dd)]),
                         html.Div([html.Label("Frekuensi", style={"fontSize":"11px"}),
                                   dcc.RadioItems(id="seki-freq",
-                                                 options=[{"label":" Kuartalan","value":"quarterly"},
-                                                          {"label":" Tahunan","value":"annual"}],
+                                                 options=[{"label":" Kuartalan",
+                                                           "value":"quarterly"},
+                                                          {"label":" Tahunan",
+                                                           "value":"annual"}],
                                                  value="quarterly", inline=True,
-                                                 labelStyle={"marginRight":"12px","color":"inherit",
+                                                 labelStyle={"marginRight":"12px",
+                                                             "color":"inherit",
                                                              "fontWeight":"bold"})]),
                         html.Div([html.Label("Satuan", style={"fontSize":"11px"}),
                                   dcc.RadioItems(id="seki-unit",
                                                  options=[{"label":" Juta USD","value":1},
                                                           {"label":" Miliar USD","value":1000}],
                                                  value=1, inline=True,
-                                                 labelStyle={"marginRight":"12px","color":"inherit",
+                                                 labelStyle={"marginRight":"12px",
+                                                             "color":"inherit",
                                                              "fontWeight":"bold"})]),
                         html.Button("▶ TAMPILKAN", id="btn-seki",
-                                    style={"padding":"10px","cursor":"pointer","fontWeight":"bold",
+                                    style={"padding":"10px","cursor":"pointer",
+                                           "fontWeight":"bold",
                                            "backgroundColor":"#6e40c9","color":"#ffffff",
                                            "border":"none","borderRadius":"4px"}),
                     ]),
@@ -695,7 +890,6 @@ app.layout = html.Div(id="main-container", children=[
 
                 html.Div(id="seki-status",
                          style={"margin":"12px 0","fontSize":"12px","minHeight":"16px"}),
-
                 html.Div(id="seki-kpi",
                          style={"display":"grid",
                                 "gridTemplateColumns":"repeat(auto-fit,minmax(210px,1fr))",
@@ -705,13 +899,15 @@ app.layout = html.Div(id="main-container", children=[
                                  "gap":"16px","marginBottom":"16px"}, children=[
                     html.Div(id="seki-c1", children=[
                         html.Div("TREN TRANSAKSI BERJALAN & KOMPONEN",
-                                 style={"fontSize":"10px","fontWeight":"bold","marginBottom":"8px"}),
+                                 style={"fontSize":"10px","fontWeight":"bold",
+                                        "marginBottom":"8px"}),
                         dcc.Graph(id="seki-g-ca", config={"displayModeBar":False},
                                   style={"height":"340px"}),
                     ]),
                     html.Div(id="seki-c2", children=[
                         html.Div("DEKOMPOSISI NERACA (TOTAL PERIODE)",
-                                 style={"fontSize":"10px","fontWeight":"bold","marginBottom":"8px"}),
+                                 style={"fontSize":"10px","fontWeight":"bold",
+                                        "marginBottom":"8px"}),
                         dcc.Graph(id="seki-g-wf", config={"displayModeBar":False},
                                   style={"height":"340px"}),
                     ]),
@@ -721,13 +917,15 @@ app.layout = html.Div(id="main-container", children=[
                                  "gap":"16px","marginBottom":"16px"}, children=[
                     html.Div(id="seki-c3", children=[
                         html.Div("TRANSAKSI FINANSIAL: KOMPONEN INVESTASI",
-                                 style={"fontSize":"10px","fontWeight":"bold","marginBottom":"8px"}),
+                                 style={"fontSize":"10px","fontWeight":"bold",
+                                        "marginBottom":"8px"}),
                         dcc.Graph(id="seki-g-inv", config={"displayModeBar":False},
                                   style={"height":"320px"}),
                     ]),
                     html.Div(id="seki-c4", children=[
                         html.Div("CADANGAN DEVISA & NERACA KESELURUHAN",
-                                 style={"fontSize":"10px","fontWeight":"bold","marginBottom":"8px"}),
+                                 style={"fontSize":"10px","fontWeight":"bold",
+                                        "marginBottom":"8px"}),
                         dcc.Graph(id="seki-g-cad", config={"displayModeBar":False},
                                   style={"height":"320px"}),
                     ]),
@@ -742,14 +940,16 @@ app.layout = html.Div(id="main-container", children=[
                                       style={"fontSize":"10px","fontWeight":"bold"}),
                             dcc.Dropdown(id="seki-dd-cmp",
                                          options=BOP_DD_OPTIONS, value=[1, 29, 48],
-                                         multi=True, style={**_dd, "minWidth":"280px"}),
+                                         multi=True,
+                                         style={**_dd, "minWidth":"280px"}),
                         ]),
                         dcc.Graph(id="seki-g-cmp", config={"displayModeBar":False},
                                   style={"height":"320px"}),
                     ]),
                     html.Div(id="seki-c6", children=[
                         html.Div("CURRENT ACCOUNT % PDB & CADDEV (BULAN IMPOR)",
-                                 style={"fontSize":"10px","fontWeight":"bold","marginBottom":"8px"}),
+                                 style={"fontSize":"10px","fontWeight":"bold",
+                                        "marginBottom":"8px"}),
                         dcc.Graph(id="seki-g-pct", config={"displayModeBar":False},
                                   style={"height":"320px"}),
                     ]),
@@ -767,9 +967,10 @@ app.layout = html.Div(id="main-container", children=[
                                          style={**_dd, "minWidth":"240px"}),
                             html.Button("⬇ Download CSV", id="btn-dl-seki",
                                         style={"padding":"8px 14px","cursor":"pointer",
-                                               "fontWeight":"bold","backgroundColor":"#6e40c9",
-                                               "color":"#ffffff","border":"none",
-                                               "borderRadius":"4px","fontFamily":FONT}),
+                                               "fontWeight":"bold",
+                                               "backgroundColor":"#6e40c9","color":"#ffffff",
+                                               "border":"none","borderRadius":"4px",
+                                               "fontFamily":FONT}),
                             dcc.Download(id="dl-seki"),
                         ]),
                     ]),
@@ -779,6 +980,7 @@ app.layout = html.Div(id="main-container", children=[
             ]),
         ]),
     ]),
+
     dcc.Interval(id="iv", interval=30_000, n_intervals=0),
 ])
 
@@ -789,6 +991,7 @@ app.layout = html.Div(id="main-container", children=[
               State("theme-store","data"))
 def toggle_theme(n, cur):
     return "light" if cur == "dark" else "dark"
+
 
 @app.callback(
     [Output("main-container","style"),
@@ -830,6 +1033,7 @@ def apply_theme(tn):
             sm, {"color":t["text"]}, {"color":t["purple"]}, sm,
             tbase, tsel, tbase, tsel, tbase, tsel, tbase, tsel, tbase, t5sel)
 
+
 @app.callback(Output("ts","children"), Input("iv","n_intervals"))
 def tick(_):
     return datetime.now().strftime("⏱ %d %b %Y  %H:%M")
@@ -840,7 +1044,8 @@ def tick(_):
 @app.callback(
     Output("store-bps","data"), Output("status-bps","children"),
     Input("btn-load-bps","n_clicks"),
-    State("dd-tahun","value"), State("dd-periode","value"), State("radio-sumber","value"),
+    State("dd-tahun","value"), State("dd-periode","value"),
+    State("radio-sumber","value"),
     prevent_initial_call=True,
 )
 def cb_fetch_bps(_, tahun, periode, sumber):
@@ -850,17 +1055,20 @@ def cb_fetch_bps(_, tahun, periode, sumber):
         df = fetch_all_bps(sumber, tahun, tipe, bulan)
         if df.empty:
             return {}, f"⚠️ Tidak ada data BPS {jenis} {tahun}."
-        return ({"data": df.to_dict("records"), "sumber": sumber,
-                 "tahun": tahun, "periode": periode},
-                f"✅ Data BPS {jenis} {tahun} berhasil dimuat — {len(df):,} baris.")
+        return (
+            {"data": df.to_dict("records"), "sumber": sumber,
+             "tahun": tahun, "periode": periode},
+            f"✅ Data BPS {jenis} {tahun} berhasil dimuat — {len(df):,} baris.",
+        )
     except Exception as e:
         return {}, f"❌ Error BPS: {e}"
 
 # ─────────────────────────────────────────────────────────────────
-#  CALLBACKS — DASHBOARD BPS
+#  CALLBACKS — DASHBOARD BPS (termasuk store-top15)
 # ─────────────────────────────────────────────────────────────────
 @app.callback(
-    [Output("kpi","children"),
+    [Output("store-top15","data"),
+     Output("kpi","children"),
      Output("g-kmd","figure"), Output("g-neg","figure"), Output("g-pie","figure"),
      Output("tabel-full","data"), Output("tabel-full","columns"),
      Output("tabel-full","style_data_conditional"),
@@ -881,10 +1089,12 @@ def update_bps(raw, neg_f, hs_f, unit, tn):
     cel = {"backgroundColor":t["bg"],"color":t["text"],
            "border":f"1px solid {t['border']}","fontFamily":FONT}
     cnd = [{"if":{"row_index":"odd"},"backgroundColor":t["card"]}]
-    empty = ([], empty_fig(t), empty_fig(t), empty_fig(t),
+
+    empty = (None, [], empty_fig(t), empty_fig(t), empty_fig(t),
              [], [], cnd, hdr, cel, [], [], cnd, hdr, cel, [], [])
     if not raw or not raw.get("data"):
         return empty
+
     df = pd.DataFrame(raw["data"])
     neg_opts = [{"label":n,"value":n} for n in sorted(df["negara"].unique())]
     if neg_f: df = df[df["negara"] == neg_f]
@@ -892,63 +1102,98 @@ def update_bps(raw, neg_f, hs_f, unit, tn):
     df["value"] = df["value"] / unit
     lbl = "Miliar USD" if unit > 1 else "USD"
     fmt = "$,.2f" if unit > 1 else "$,.0f"
+
+    is_ekspor = raw.get("sumber") == "1"
+    jenis     = "Ekspor" if is_ekspor else "Impor"
+    col       = t["green"] if is_ekspor else t["red"]
+
     kmd  = df.groupby("kodehs", as_index=False)[["value","berat"]].sum().sort_values("value", ascending=False)
     neg  = df.groupby("negara",  as_index=False)["value"].sum().sort_values("value", ascending=False)
     full = df.groupby(["negara","kodehs"], as_index=False)[["value","berat"]].sum()
     ews  = calculate_ews(kmd.copy())
     full["deskripsi"] = full["kodehs"].map(HS_DESC).fillna("Lainnya")
-    kurs, klbl = get_kurs(raw.get("tahun", str(TAHUN_SAAT_INI)), raw.get("periode","tahunan"))
+
+    # ── Simpan data top-15 ke store ───────────────────────────────
+    top15 = kmd.head(15).copy()
+    top15["deskripsi"] = top15["kodehs"].map(HS_DESC).fillna("Lainnya")
+    top15_store = {
+        "data":       top15.to_dict("records"),
+        "unit_label": lbl,
+        "tahun":      raw.get("tahun", str(TAHUN_SAAT_INI)),
+        "jenis":      jenis,
+        "is_ekspor":  is_ekspor,
+    }
+
+    kurs, klbl = get_kurs(raw.get("tahun", str(TAHUN_SAAT_INI)),
+                          raw.get("periode","tahunan"))
     total = df["value"].sum()
-    jenis = "EKSPOR" if raw["sumber"] == "1" else "IMPOR"
-    col   = t["green"] if raw["sumber"] == "1" else t["red"]
+
     kpis = [
         html.Div(style={"background":t["card"],"border":f"1px solid {t['border']}",
                          "borderTop":f"3px solid {col}","padding":"16px","borderRadius":"8px"},
-                 children=[html.Div(f"TOTAL {jenis} BPS",style={"fontSize":"10px","color":t["muted"]}),
+                 children=[html.Div(f"TOTAL {jenis.upper()} BPS",
+                                    style={"fontSize":"10px","color":t["muted"]}),
                             html.Div(f"{total:,.2f} {lbl}",
                                      style={"fontSize":"20px","fontWeight":"bold","color":col})]),
         html.Div(style={"background":t["card"],"border":f"1px solid {t['border']}",
                          "borderTop":f"3px solid {t['accent']}","padding":"16px","borderRadius":"8px"},
-                 children=[html.Div("KOMODITAS TERBESAR",style={"fontSize":"10px","color":t["muted"]}),
+                 children=[html.Div("KOMODITAS TERBESAR",
+                                    style={"fontSize":"10px","color":t["muted"]}),
                             html.Div(kmd.iloc[0]["kodehs"] if not kmd.empty else "-",
-                                     style={"fontSize":"20px","fontWeight":"bold","color":t["accent"]})]),
+                                     style={"fontSize":"20px","fontWeight":"bold",
+                                            "color":t["accent"]})]),
         html.Div(style={"background":t["card"],"border":f"1px solid {t['border']}",
                          "borderTop":f"3px solid {t['yellow']}","padding":"16px","borderRadius":"8px"},
                  children=[html.Div(klbl,style={"fontSize":"10px","color":t["muted"]}),
                             html.Div(f"Rp {kurs:,.0f}" if kurs else "N/A",
-                                     style={"fontSize":"20px","fontWeight":"bold","color":t["yellow"]})]),
+                                     style={"fontSize":"20px","fontWeight":"bold",
+                                            "color":t["yellow"]})]),
     ]
-    fk = go.Figure(go.Bar(y=kmd["kodehs"].head(15), x=kmd["value"].head(15),
-                            orientation="h", marker_color=col)
-                   ).update_layout(**bc, height=350, yaxis=dict(autorange="reversed"))
-    fn = go.Figure(go.Bar(y=neg["negara"].head(15), x=neg["value"].head(15),
-                            orientation="h", marker_color=t["blue"])
-                   ).update_layout(**bc, height=350, yaxis=dict(autorange="reversed"))
-    fp = go.Figure(go.Pie(labels=kmd["kodehs"].head(8), values=kmd["value"].head(8),
-                            hole=.45, marker=dict(line=dict(color=t["bg"], width=2)))
-                   ).update_layout(**bc, height=350, legend=dict(bgcolor="rgba(0,0,0,0)"))
+
+    fk = go.Figure(go.Bar(
+        y=kmd["kodehs"].head(15), x=kmd["value"].head(15),
+        orientation="h", marker_color=col,
+    )).update_layout(**bc, height=350, yaxis=dict(autorange="reversed"))
+
+    fn = go.Figure(go.Bar(
+        y=neg["negara"].head(15), x=neg["value"].head(15),
+        orientation="h", marker_color=t["blue"],
+    )).update_layout(**bc, height=350, yaxis=dict(autorange="reversed"))
+
+    fp = go.Figure(go.Pie(
+        labels=kmd["kodehs"].head(8), values=kmd["value"].head(8),
+        hole=.45, marker=dict(line=dict(color=t["bg"], width=2)),
+    )).update_layout(**bc, height=350, legend=dict(bgcolor="rgba(0,0,0,0)"))
+
     cols_full = [
         {"name":"Negara Mitra","id":"negara"},
         {"name":"HS","id":"kodehs"},
         {"name":"Deskripsi","id":"deskripsi"},
-        {"name":f"Nilai BPS ({lbl})","id":"value","type":"numeric","format":{"specifier":fmt}},
+        {"name":f"Nilai BPS ({lbl})","id":"value",
+         "type":"numeric","format":{"specifier":fmt}},
     ]
     cols_ews = [
         {"name":"HS","id":"kodehs"},
-        {"name":f"Nilai ({lbl})","id":"value","type":"numeric","format":{"specifier":fmt}},
-        {"name":"Volume (kg/ton)*","id":"berat","type":"numeric","format":{"specifier":",.0f"}},
-        {"name":f"Harga Est. ({lbl}/unit)*","id":"harga","type":"numeric","format":{"specifier":",.4f"}},
-        {"name":"Z-Score Nilai","id":"z_score","type":"numeric","format":{"specifier":".2f"}},
-        {"name":"Z-Score Harga","id":"z_score_harga","type":"numeric","format":{"specifier":".2f"}},
+        {"name":f"Nilai ({lbl})","id":"value",
+         "type":"numeric","format":{"specifier":fmt}},
+        {"name":"Volume (kg/ton)*","id":"berat",
+         "type":"numeric","format":{"specifier":",.0f"}},
+        {"name":f"Harga Est. ({lbl}/unit)*","id":"harga",
+         "type":"numeric","format":{"specifier":",.4f"}},
+        {"name":"Z-Score Nilai","id":"z_score",
+         "type":"numeric","format":{"specifier":".2f"}},
+        {"name":"Z-Score Harga","id":"z_score_harga",
+         "type":"numeric","format":{"specifier":".2f"}},
         {"name":"Indikator","id":"status_ews"},
     ]
     cnd_ews = cnd + [
-        {"if":{"filter_query":"{status_ews} contains 'Atas'"},"color":t["red"]},
+        {"if":{"filter_query":"{status_ews} contains 'Atas'"},  "color":t["red"]},
         {"if":{"filter_query":"{status_ews} contains 'Bawah'"},"color":t["yellow"]},
         {"if":{"filter_query":"{status_ews} contains 'Anomali Harga'"},"color":t["accent"]},
-        {"if":{"filter_query":"{status_ews} contains 'KRITIS'"},"backgroundColor":t["red"],"color":"white"},
+        {"if":{"filter_query":"{status_ews} contains 'KRITIS'"},
+         "backgroundColor":t["red"],"color":"white"},
     ]
-    return (kpis, fk, fn, fp,
+    return (top15_store, kpis, fk, fn, fp,
             full.to_dict("records"), cols_full, cnd, hdr, cel,
             ews.to_dict("records"), cols_ews, cnd_ews, hdr, cel,
             neg_opts, neg_opts)
@@ -968,6 +1213,7 @@ def update_hist(_, hs, negara, metric, periode, sumber, unit, tn):
     if not hs:
         return empty_fig(t, "⚠️ Pilih HS terlebih dahulu lalu tekan Tampilkan Histori.")
     tipe, bulan = get_periode_params(periode)
+
     def fetch_year(y):
         rows = fetch_one(sumber, hs, str(y), tipe, bulan)
         df_y = pd.DataFrame(parse_rows(rows, hs))
@@ -975,13 +1221,16 @@ def update_hist(_, hs, negara, metric, periode, sumber, unit, tn):
             if negara: df_y = df_y[df_y["negara"] == negara]
             return {"Tahun": str(y), "Value": df_y["value"].sum() / unit}
         return {"Tahun": str(y), "Value": 0}
+
     data = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futs = {pool.submit(fetch_year, y): y for y in TAHUN_TERSEDIA}
         for f in as_completed(futs, timeout=60):
             data.append(f.result())
+
     df_h = pd.DataFrame(data).sort_values("Tahun")
     lbl  = "Miliar USD" if unit > 1 else "USD"
+
     if metric == "yoy":
         df_h["Value"] = df_h["Value"].pct_change() * 100
         fig = px.line(df_h, x="Tahun", y="Value", markers=True,
@@ -1018,16 +1267,21 @@ def cb_mirroring(_, mitra, tahun, sumber, unit, tn):
     cel = {"backgroundColor":t["bg"],"color":t["text"],
            "border":f"1px solid {t['border']}","fontFamily":FONT}
     cnd = [{"if":{"row_index":"odd"},"backgroundColor":t["card"]}]
+
     def _empty(msg):
         return ([], empty_fig(t), empty_fig(t), [], [], cnd, hdr, cel, msg)
+
     if not mitra:
         return _empty("⚠️ Pilih mitra dagang terlebih dahulu.")
+
     lbl_unit = "Juta USD" if unit > 1 else "USD"
     fmt      = "$,.1f" if unit > 1 else "$,.0f"
     tipe, bulan = get_periode_params("tahunan")
-    df_bps_all  = fetch_all_bps(sumber, tahun, tipe, bulan)
+
+    df_bps_all = fetch_all_bps(sumber, tahun, tipe, bulan)
     if df_bps_all.empty:
         return _empty(f"⚠️ Tidak ada data BPS {tahun}. Coba muat ulang.")
+
     mitra_norm = normalize_negara(mitra)
     df_bps = df_bps_all[df_bps_all["negara"] == mitra_norm].copy()
     if df_bps.empty:
@@ -1039,24 +1293,28 @@ def cb_mirroring(_, mitra, tahun, sumber, unit, tn):
             html.Span("Negara tersedia: " + ", ".join(f"'{n}'" for n in negara_ada[:20]),
                       style={"color":t["blue"],"fontSize":"11px","fontFamily":"monospace"}),
         ]))
+
     df_bps = df_bps.groupby("kodehs", as_index=False)["value"].sum()
     df_bps.rename(columns={"kodehs":"HS","value":"BPS_Value"}, inplace=True)
     df_bps["HS"] = df_bps["HS"].apply(clean_hs)
+
     df_tm, status = load_trademap(mitra, tahun, sumber)
     if status == "FILE_NOT_FOUND":
         return _empty(html.Span("❌ File 'data_trademap.xlsx' tidak ditemukan.",
                                 style={"color":t["red"]}))
     elif status == "INVALID_COLUMNS":
-        return _empty(html.Span("❌ Kolom Excel salah.",style={"color":t["red"]}))
+        return _empty(html.Span("❌ Kolom Excel salah.", style={"color":t["red"]}))
     elif status.startswith("DATA_EMPTY_TAHUN"):
         tahun_ada = status.split("|")[1] if "|" in status else "-"
-        return _empty(html.Span(f"⚠️ Data Trade Map '{mitra}' tahun {tahun} tidak ada. "
-                                f"Tahun tersedia: {tahun_ada}", style={"color":t["yellow"]}))
+        return _empty(html.Span(
+            f"⚠️ Data Trade Map '{mitra}' tahun {tahun} tidak ada. "
+            f"Tahun tersedia: {tahun_ada}", style={"color":t["yellow"]}))
     elif status == "DATA_EMPTY":
         return _empty(html.Span(f"⚠️ Mitra '{mitra}' tidak ditemukan di Excel.",
                                 style={"color":t["yellow"]}))
     elif status != "SUCCESS":
         return _empty(html.Span(f"❌ Error Excel: {status}", style={"color":t["red"]}))
+
     df_tm["HS"] = df_tm["HS"].apply(clean_hs)
     df = pd.merge(df_bps, df_tm, on="HS", how="outer").fillna(0)
     df["Diff_Value"] = df["Trademap_Value"] - df["BPS_Value"]
@@ -1064,6 +1322,7 @@ def cb_mirroring(_, mitra, tahun, sumber, unit, tn):
     df["Deskripsi"]  = df["HS"].map(HS_DESC).fillna("Komoditas Lainnya")
     df = df.sort_values("BPS_Value", ascending=False)
     df[["BPS_Value","Trademap_Value","Diff_Value"]] /= unit
+
     tot_bps = df["BPS_Value"].sum()
     tot_tm  = df["Trademap_Value"].sum()
     selisih = tot_tm - tot_bps
@@ -1071,67 +1330,93 @@ def cb_mirroring(_, mitra, tahun, sumber, unit, tn):
     n_match = int(((df["BPS_Value"] > 0) & (df["Trademap_Value"] > 0)).sum())
     n_bps   = int(((df["BPS_Value"] > 0) & (df["Trademap_Value"] == 0)).sum())
     n_tm    = int(((df["BPS_Value"] == 0) & (df["Trademap_Value"] > 0)).sum())
+
     lbl_bps = "EKSPOR IDN KE" if sumber == "1" else "IMPOR IDN DARI"
     lbl_tm  = "IMPOR MITRA DARI IDN" if sumber == "1" else "EKSPOR MITRA KE IDN"
+
     kpis = [
         html.Div(style={"background":t["card"],"border":f"1px solid {t['border']}",
                          "borderTop":f"3px solid {t['accent']}","padding":"16px","borderRadius":"8px"},
                  children=[html.Div(f"{lbl_bps} {mitra.upper()} (BPS)",
                                     style={"fontSize":"10px","color":t["muted"]}),
                             html.Div(f"{tot_bps:,.1f} {lbl_unit}",
-                                     style={"fontSize":"20px","fontWeight":"bold","color":t["accent"]})]),
+                                     style={"fontSize":"20px","fontWeight":"bold",
+                                            "color":t["accent"]})]),
         html.Div(style={"background":t["card"],"border":f"1px solid {t['border']}",
                          "borderTop":f"3px solid {t['blue']}","padding":"16px","borderRadius":"8px"},
                  children=[html.Div(f"{lbl_tm} (Trade Map)",
                                     style={"fontSize":"10px","color":t["muted"]}),
                             html.Div(f"{tot_tm:,.1f} {lbl_unit}",
-                                     style={"fontSize":"20px","fontWeight":"bold","color":t["blue"]})]),
+                                     style={"fontSize":"20px","fontWeight":"bold",
+                                            "color":t["blue"]})]),
         html.Div(style={"background":t["card"],"border":f"1px solid {t['border']}",
                          "borderTop":f"3px solid {t['yellow']}","padding":"16px","borderRadius":"8px"},
-                 children=[html.Div("TOTAL ASIMETRI",style={"fontSize":"10px","color":t["muted"]}),
+                 children=[html.Div("TOTAL ASIMETRI",
+                                    style={"fontSize":"10px","color":t["muted"]}),
                             html.Div(f"{selisih:,.1f} {lbl_unit}  ({pct:+.1f}%)",
-                                     style={"fontSize":"20px","fontWeight":"bold","color":t["yellow"]})]),
+                                     style={"fontSize":"20px","fontWeight":"bold",
+                                            "color":t["yellow"]})]),
     ]
+
     top10 = df.nlargest(10, "BPS_Value").copy()
     top10["label"] = top10["HS"] + " – " + top10["Deskripsi"].str[:18]
     fig1 = go.Figure([
-        go.Bar(name="BPS",       x=top10["label"], y=top10["BPS_Value"], marker_color=t["green"]),
-        go.Bar(name="Trade Map", x=top10["label"], y=top10["Trademap_Value"], marker_color=t["red"]),
-    ]).update_layout(**bc, barmode="group", height=360, xaxis=dict(tickangle=-30),
-                     legend=dict(orientation="h", yanchor="bottom", y=1.02, x=1, xanchor="right"))
+        go.Bar(name="BPS",       x=top10["label"], y=top10["BPS_Value"],
+               marker_color=t["green"]),
+        go.Bar(name="Trade Map", x=top10["label"], y=top10["Trademap_Value"],
+               marker_color=t["red"]),
+    ]).update_layout(**bc, barmode="group", height=360,
+                     xaxis=dict(tickangle=-30),
+                     legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                 x=1, xanchor="right"))
+
     df["Abs_Diff"] = df["Diff_Value"].abs()
     top5 = df.nlargest(5, "Abs_Diff").copy()
     top5["label"] = top5["HS"] + " – " + top5["Deskripsi"].str[:18]
     fig2 = go.Figure([
-        go.Bar(name="BPS",       x=top5["label"], y=top5["BPS_Value"], marker_color=t["green"],
-               text=top5["BPS_Value"].apply(lambda v: f"{v:,.1f}"), textposition="outside"),
-        go.Bar(name="Trade Map", x=top5["label"], y=top5["Trademap_Value"], marker_color=t["red"],
-               text=top5["Trademap_Value"].apply(lambda v: f"{v:,.1f}"), textposition="outside"),
-    ]).update_layout(**bc, barmode="group", height=360, xaxis=dict(tickangle=-30),
-                     legend=dict(orientation="h", yanchor="bottom", y=1.02, x=1, xanchor="right"))
+        go.Bar(name="BPS", x=top5["label"], y=top5["BPS_Value"],
+               marker_color=t["green"],
+               text=top5["BPS_Value"].apply(lambda v: f"{v:,.1f}"),
+               textposition="outside"),
+        go.Bar(name="Trade Map", x=top5["label"], y=top5["Trademap_Value"],
+               marker_color=t["red"],
+               text=top5["Trademap_Value"].apply(lambda v: f"{v:,.1f}"),
+               textposition="outside"),
+    ]).update_layout(**bc, barmode="group", height=360,
+                     xaxis=dict(tickangle=-30),
+                     legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                 x=1, xanchor="right"))
+
     cols = [
         {"name":"HS","id":"HS"},
         {"name":"Deskripsi Komoditas","id":"Deskripsi"},
-        {"name":f"BPS ({lbl_unit})","id":"BPS_Value","type":"numeric","format":{"specifier":fmt}},
-        {"name":f"Trade Map ({lbl_unit})","id":"Trademap_Value","type":"numeric","format":{"specifier":fmt}},
-        {"name":f"Selisih ({lbl_unit})","id":"Diff_Value","type":"numeric","format":{"specifier":fmt}},
+        {"name":f"BPS ({lbl_unit})","id":"BPS_Value",
+         "type":"numeric","format":{"specifier":fmt}},
+        {"name":f"Trade Map ({lbl_unit})","id":"Trademap_Value",
+         "type":"numeric","format":{"specifier":fmt}},
+        {"name":f"Selisih ({lbl_unit})","id":"Diff_Value",
+         "type":"numeric","format":{"specifier":fmt}},
     ]
     cnd_tbl = cnd + [
-        {"if":{"filter_query":"{Diff_Value} > 0","column_id":"Diff_Value"},"color":t["green"]},
-        {"if":{"filter_query":"{Diff_Value} < 0","column_id":"Diff_Value"},"color":t["red"]},
+        {"if":{"filter_query":"{Diff_Value} > 0","column_id":"Diff_Value"},
+         "color":t["green"]},
+        {"if":{"filter_query":"{Diff_Value} < 0","column_id":"Diff_Value"},
+         "color":t["red"]},
     ]
     disp = ["HS","Deskripsi","BPS_Value","Trademap_Value","Diff_Value"]
     return (kpis, fig1, fig2,
             df[disp].to_dict("records"), cols, cnd_tbl, hdr, cel,
-            html.Span(f"✅ Mirroring selesai — matched:{n_match} | BPS:{n_bps} | TM:{n_tm}",
-                      style={"color":t["green"]}))
+            html.Span(
+                f"✅ Mirroring selesai — matched:{n_match} | BPS:{n_bps} | TM:{n_tm}",
+                style={"color":t["green"]}))
 
 # ─────────────────────────────────────────────────────────────────
 #  CALLBACKS — DOWNLOAD
 # ─────────────────────────────────────────────────────────────────
 @app.callback(
     Output("dl-bps","data"), Input("btn-dl-bps","n_clicks"),
-    State("store-bps","data"), State("input-negara","value"), State("input-hs","value"),
+    State("store-bps","data"), State("input-negara","value"),
+    State("input-hs","value"),
     prevent_initial_call=True,
 )
 def download_bps(_, raw, neg_f, hs_f):
@@ -1142,21 +1427,74 @@ def download_bps(_, raw, neg_f, hs_f):
     if hs_f:  df = df[df["kodehs"] == hs_f]
     full = df.groupby(["negara","kodehs"], as_index=False)[["value","berat"]].sum()
     full["deskripsi"] = full["kodehs"].map(HS_DESC).fillna("Lainnya")
-    full.rename(columns={"negara":"Negara","kodehs":"HS","value":"Nilai_USD","berat":"Volume"}, inplace=True)
+    full.rename(columns={"negara":"Negara","kodehs":"HS",
+                          "value":"Nilai_USD","berat":"Volume"}, inplace=True)
     tahun = raw.get("tahun","")
     jenis = "Ekspor" if raw.get("sumber") == "1" else "Impor"
     return dcc.send_data_frame(full.to_csv, f"BPS_{jenis}_{tahun}.csv", index=False)
 
+
+@app.callback(
+    Output("dl-top15-csv","data"),
+    Input("btn-dl-top15-csv","n_clicks"),
+    State("store-top15","data"),
+    prevent_initial_call=True,
+)
+def download_top15_csv(_, store):
+    if not store or not store.get("data"):
+        return None
+    df = pd.DataFrame(store["data"])
+    jenis = store.get("jenis", "Ekspor")
+    tahun = store.get("tahun", "")
+    lbl   = store.get("unit_label", "USD")
+
+    df_out = df.rename(columns={
+        "kodehs":    "Kode HS",
+        "deskripsi": "Deskripsi Komoditas",
+        "value":     f"Nilai ({lbl})",
+        "berat":     "Volume (kg)",
+    })
+    # Tambahkan kolom share
+    total = df_out[f"Nilai ({lbl})"].sum()
+    df_out["Share (%)"] = (df_out[f"Nilai ({lbl})"] / total * 100).round(2)
+    df_out.insert(0, "No", range(1, len(df_out) + 1))
+
+    return dcc.send_data_frame(df_out.to_csv,
+                               f"Top15_{jenis}_{tahun}.csv", index=False)
+
+
+@app.callback(
+    Output("dl-top15-xlsx","data"),
+    Input("btn-dl-top15-xlsx","n_clicks"),
+    State("store-top15","data"),
+    prevent_initial_call=True,
+)
+def download_top15_xlsx(_, store):
+    if not store or not store.get("data"):
+        return None
+    df       = pd.DataFrame(store["data"])
+    jenis    = store.get("jenis", "Ekspor")
+    tahun    = store.get("tahun", "")
+    unit_lbl = store.get("unit_label", "USD")
+    is_eksp  = store.get("is_ekspor", True)
+
+    xlsx_bytes = build_top15_xlsx(df, jenis, tahun, unit_lbl, is_eksp)
+    return dcc.send_bytes(lambda _: xlsx_bytes,
+                          f"Top15_{jenis}_{tahun}.xlsx")
+
+
 @app.callback(
     Output("dl-mirror","data"), Input("btn-dl-mirror","n_clicks"),
-    State("tabel-mirror","data"), State("dd-mitra","value"), State("dd-tahun","value"),
+    State("tabel-mirror","data"), State("dd-mitra","value"),
+    State("dd-tahun","value"),
     prevent_initial_call=True,
 )
 def download_mirror(_, tbl_data, mitra, tahun):
     if not tbl_data:
         return None
     df = pd.DataFrame(tbl_data)
-    return dcc.send_data_frame(df.to_csv, f"Mirroring_{(mitra or 'mitra').replace(' ','_')}_{tahun}.csv", index=False)
+    fname = f"Mirroring_{(mitra or 'mitra').replace(' ','_')}_{tahun}.csv"
+    return dcc.send_data_frame(df.to_csv, fname, index=False)
 
 # ─────────────────────────────────────────────────────────────────
 #  CALLBACKS — SEKI TAB 5
@@ -1239,40 +1577,45 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
 
     def kpi_card(color, label, val, sub=""):
         vstr = f"{val:,.1f} {lbl}" if val is not None else "N/A"
-        return html.Div(style={"background":t["card"],"border":f"1px solid {t['border']}",
-                                "borderTop":f"3px solid {color}","padding":"16px","borderRadius":"8px"},
-                        children=[html.Div(label, style={"fontSize":"10px","color":t["muted"]}),
-                                  html.Div(vstr, style={"fontSize":"18px","fontWeight":"bold","color":color}),
-                                  html.Div(sub, style={"fontSize":"10px","color":t["muted"]})])
+        return html.Div(
+            style={"background":t["card"],"border":f"1px solid {t['border']}",
+                   "borderTop":f"3px solid {color}","padding":"16px","borderRadius":"8px"},
+            children=[
+                html.Div(label, style={"fontSize":"10px","color":t["muted"]}),
+                html.Div(vstr,  style={"fontSize":"18px","fontWeight":"bold","color":color}),
+                html.Div(sub,   style={"fontSize":"10px","color":t["muted"]}),
+            ])
 
     ca_v = bop_latest_val(1)
     kpis = [
         kpi_card(t["green"] if (ca_v or 0) >= 0 else t["red"],
                  "TRANSAKSI BERJALAN (TERBARU)", kv(1), _BOP_LATEST),
         kpi_card(t["accent"], "CADANGAN DEVISA (TERBARU)",
-                 bop_latest_val(54) / udiv if bop_latest_val(54) else None, _BOP_LATEST),
+                 bop_latest_val(54) / udiv if bop_latest_val(54) else None,
+                 _BOP_LATEST),
         kpi_card(t["purple"], "NERACA KESELURUHAN (TERBARU)", kv(48), "Surplus > 0"),
-        kpi_card(t["yellow"], "CA % PDB (TERBARU)",
-                 bop_latest_val(56), "Defisit < 0"),
     ]
     ca_pdb_v = bop_latest_val(56)
-    kpis[3] = html.Div(
+    kpis.append(html.Div(
         style={"background":t["card"],"border":f"1px solid {t['border']}",
                "borderTop":f"3px solid {t['yellow']}","padding":"16px","borderRadius":"8px"},
-        children=[html.Div("CA % PDB (TERBARU)", style={"fontSize":"10px","color":t["muted"]}),
-                  html.Div(f"{ca_pdb_v:.1f}%" if ca_pdb_v is not None else "N/A",
-                           style={"fontSize":"18px","fontWeight":"bold","color":t["yellow"]}),
-                  html.Div("Defisit < 0", style={"fontSize":"10px","color":t["muted"]})])
+        children=[
+            html.Div("CA % PDB (TERBARU)", style={"fontSize":"10px","color":t["muted"]}),
+            html.Div(f"{ca_pdb_v:.1f}%" if ca_pdb_v is not None else "N/A",
+                     style={"fontSize":"18px","fontWeight":"bold","color":t["yellow"]}),
+            html.Div("Defisit < 0", style={"fontSize":"10px","color":t["muted"]}),
+        ]))
 
+    # Chart: Transaksi Berjalan
     fig_ca = go.Figure()
-    for iid, lbl_c, col in [
-        (2,"Barang",t["green"]), (17,"Jasa",t["blue"]),
-        (20,"Pend. Primer",t["yellow"]), (23,"Pend. Sekunder",t["orange"]),
+    for iid, lbl_c, c in [
+        (2,"Barang",t["green"]),(17,"Jasa",t["blue"]),
+        (20,"Pend. Primer",t["yellow"]),(23,"Pend. Sekunder",t["orange"]),
     ]:
         s = gs(iid)
         if not s.empty:
             fig_ca.add_trace(go.Bar(x=s[xcol], y=s["v"], name=lbl_c,
-                                    marker_color=col, opacity=0.8))
+                                    marker_color=c, opacity=0.8))
     s_ca = gs(1)
     if not s_ca.empty:
         fig_ca.add_trace(go.Scatter(x=s_ca[xcol], y=s_ca["v"], name="Total CA",
@@ -1283,6 +1626,7 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
                           legend=dict(orientation="h", yanchor="bottom", y=1.02,
                                       bgcolor="rgba(0,0,0,0)"))
 
+    # Chart: Waterfall
     wf_ids = [1, 26, 29, 47, 48]
     wf_lbl = ["Transaksi\nBerjalan","Transaksi\nModal",
                "Transaksi\nFinansial","Selisih\nPerhitungan","Neraca\nKeseluruhan"]
@@ -1291,7 +1635,8 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
         s = gs(iid)
         wf_v.append(float(s["v"].sum()) if not s.empty else 0)
     fig_wf = go.Figure(go.Waterfall(
-        x=wf_lbl, measure=["relative","relative","relative","relative","total"],
+        x=wf_lbl,
+        measure=["relative","relative","relative","relative","total"],
         y=wf_v,
         connector=dict(line=dict(color=t["border"], width=1.5)),
         decreasing=dict(marker_color=t["red"]),
@@ -1301,15 +1646,16 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
     ))
     fig_wf.update_layout(**bc, height=340, showlegend=False, yaxis_title=lbl)
 
+    # Chart: Investasi
     fig_inv = go.Figure()
-    for iid, lbl_i, col in [
-        (32,"FDI",t["green"]), (35,"Portofolio",t["blue"]),
-        (41,"Lainnya",t["orange"]), (40,"Derivatif",t["yellow"]),
+    for iid, lbl_i, c in [
+        (32,"FDI",t["green"]),(35,"Portofolio",t["blue"]),
+        (41,"Lainnya",t["orange"]),(40,"Derivatif",t["yellow"]),
     ]:
         s = gs(iid)
         if not s.empty:
             fig_inv.add_trace(go.Bar(x=s[xcol], y=s["v"], name=lbl_i,
-                                     marker_color=col, opacity=0.85))
+                                     marker_color=c, opacity=0.85))
     s_fin = gs(29)
     if not s_fin.empty:
         fig_inv.add_trace(go.Scatter(x=s_fin[xcol], y=s_fin["v"], name="Total Fin.",
@@ -1321,16 +1667,19 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
                            legend=dict(orientation="h", yanchor="bottom", y=1.02,
                                        bgcolor="rgba(0,0,0,0)"))
 
+    # Chart: Cadangan Devisa
     fig_cad = go.Figure()
     s_cad = gs(54)
     s_ner = gs(48)
     if not s_cad.empty:
-        fig_cad.add_trace(go.Scatter(x=s_cad[xcol], y=s_cad["v"], name="Cadangan Devisa",
+        fig_cad.add_trace(go.Scatter(x=s_cad[xcol], y=s_cad["v"],
+                                     name="Cadangan Devisa",
                                      fill="tozeroy", mode="lines",
                                      line=dict(color=t["teal"], width=2),
                                      fillcolor="rgba(57,208,216,0.12)"))
     if not s_ner.empty:
-        fig_cad.add_trace(go.Bar(x=s_ner[xcol], y=s_ner["v"], name="Neraca Keseluruhan",
+        fig_cad.add_trace(go.Bar(x=s_ner[xcol], y=s_ner["v"],
+                                  name="Neraca Keseluruhan",
                                   marker_color=[t["green"] if v >= 0 else t["red"]
                                                 for v in s_ner["v"]],
                                   opacity=0.8, yaxis="y2"))
@@ -1340,9 +1689,11 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
         yaxis=dict(title=f"Caddev ({lbl})", gridcolor=t["grid"]),
         yaxis2=dict(title=f"Neraca ({lbl})", overlaying="y", side="right",
                     gridcolor="rgba(0,0,0,0)"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, bgcolor="rgba(0,0,0,0)"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    bgcolor="rgba(0,0,0,0)"),
     )
 
+    # Chart: CA % PDB
     fig_pct = go.Figure()
     s_pct = df_all[df_all["item_id"] == 56].copy().sort_values("year")
     s_bln = df_all[df_all["item_id"] == 55].copy().sort_values("year")
@@ -1362,9 +1713,11 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
         yaxis=dict(title="CA % PDB", gridcolor=t["grid"]),
         yaxis2=dict(title="Bulan Impor", overlaying="y", side="right",
                     gridcolor="rgba(0,0,0,0)"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, bgcolor="rgba(0,0,0,0)"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    bgcolor="rgba(0,0,0,0)"),
     )
 
+    # Tabel
     if tbl_f:
         df_t = df_all[df_all["item_id"].isin(tbl_f)].copy()
     else:
@@ -1372,10 +1725,12 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
     df_t["nilai"] = df_t["value_mn_usd"] / udiv
     if freq == "quarterly":
         df_t = df_t[["period","keterangan","items_en","nilai"]].rename(
-            columns={"period":"Periode","keterangan":"Keterangan","items_en":"English","nilai":lbl})
+            columns={"period":"Periode","keterangan":"Keterangan",
+                     "items_en":"English","nilai":lbl})
     else:
         df_t = df_t[["year","keterangan","items_en","nilai"]].rename(
-            columns={"year":"Tahun","keterangan":"Keterangan","items_en":"English","nilai":lbl})
+            columns={"year":"Tahun","keterangan":"Keterangan",
+                     "items_en":"English","nilai":lbl})
     tbl_cols = [{"name":c,"id":c,
                  **({"type":"numeric","format":{"specifier":",.1f"}} if c == lbl else {})}
                 for c in df_t.columns]
@@ -1401,7 +1756,7 @@ def cb_seki(_, y1, y2, freq, udiv, tbl_f, tn):
     prevent_initial_call=True,
 )
 def cb_seki_cmp(item_ids, y1, y2, freq, udiv, tn):
-    t = THEMES[tn]
+    t   = THEMES[tn]
     lbl = "Miliar USD" if udiv == 1000 else "Juta USD"
     if not item_ids or not _BOP_OK:
         return empty_fig(t, "Pilih indikator untuk membandingkan.")
