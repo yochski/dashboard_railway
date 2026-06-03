@@ -1,6 +1,6 @@
 """
 Ultimate Dashboard Ekspor-Impor Indonesia + Neraca Pembayaran SEKI BI
-Versi: Streamlit (UI/UX Refined ala Dash + GDrive DB)
+Versi: Streamlit (UI/UX Refined + Categorical Axis Fix)
 """
 
 import os, re, sqlite3, io
@@ -49,11 +49,40 @@ HS_DESC = {
     "01":"Binatang Hidup","02":"Daging & Produk Daging","03":"Ikan & Produk Ikan",
     "04":"Produk Susu & Telur","05":"Produk Hewani Lainnya","06":"Tanaman Hidup & Bunga",
     "07":"Sayuran","08":"Buah-buahan","09":"Kopi, Teh & Rempah","10":"Serealia",
-    "15":"Lemak & Minyak Nabati/Hewani", "27":"Bahan Bakar Mineral & Minyak Bumi",
-    "71":"Batu Permata & Logam Mulia", "72":"Besi & Baja", "73":"Barang dari Besi/Baja",
-    "84":"Mesin & Perlengkapan Mekanik", "85":"Mesin & Perlengkapan Listrik",
-    "87":"Kendaraan Bermotor", "99":"Barang Lainnya",
-} 
+    "11":"Produk Penggilingan","12":"Biji Minyak","13":"Getah & Resin",
+    "14":"Bahan Nabati Lainnya","15":"Lemak & Minyak Nabati/Hewani","16":"Olahan Daging & Ikan",
+    "17":"Gula & Kembang Gula","18":"Kakao & Olahannya","19":"Olahan Sereal & Tepung",
+    "20":"Olahan Sayur & Buah","21":"Aneka Olahan Pangan","22":"Minuman & Cuka",
+    "23":"Ampas Industri Pangan","24":"Tembakau","25":"Garam, Belerang & Batu",
+    "26":"Bijih, Terak & Abu","27":"Bahan Bakar Mineral & Minyak Bumi",
+    "28":"Kimia Anorganik","29":"Kimia Organik","30":"Produk Farmasi",
+    "31":"Pupuk","32":"Cat, Tinta & Vernis","33":"Minyak Atsiri & Kosmetik",
+    "34":"Sabun & Deterjen","35":"Albuminoid & Pati","36":"Bahan Peledak",
+    "37":"Produk Foto","38":"Kimia Lainnya","39":"Plastik & Barang Plastik",
+    "40":"Karet & Barang Karet","41":"Kulit Mentah & Samak","42":"Barang Kulit & Tas",
+    "43":"Bulu Binatang","44":"Kayu & Produk Kayu","45":"Gabus",
+    "46":"Produk Anyaman","47":"Bubur Kayu (Pulp)","48":"Kertas & Karton",
+    "49":"Buku & Produk Cetak","50":"Sutra","51":"Wol & Bulu Halus",
+    "52":"Kapas","53":"Serat Tekstil Lainnya","54":"Filamen Buatan",
+    "55":"Serat Staple Buatan","56":"Benang & Kain Khusus","57":"Karpet & Alas Lantai",
+    "58":"Kain Tenunan Khusus","59":"Kain Teknik","60":"Kain Rajut",
+    "61":"Pakaian Rajut","62":"Pakaian Tenun","63":"Tekstil Rumah Tangga",
+    "64":"Alas Kaki","65":"Topi & Aksesori Kepala","66":"Payung & Tongkat",
+    "67":"Bulu Olahan & Bunga Buatan","68":"Barang dari Batu & Semen",
+    "69":"Produk Keramik","70":"Kaca & Produk Kaca",
+    "71":"Batu Permata & Logam Mulia","72":"Besi & Baja",
+    "73":"Barang dari Besi/Baja","74":"Tembaga & Produknya",
+    "75":"Nikel & Produknya","76":"Aluminium & Produknya",
+    "78":"Timbal & Produknya","79":"Seng & Produknya","80":"Timah & Produknya",
+    "81":"Logam Dasar Lainnya","82":"Perkakas & Peralatan Logam",
+    "83":"Barang Logam Lainnya","84":"Mesin & Perlengkapan Mekanik",
+    "85":"Mesin & Perlengkapan Listrik","86":"Kereta Api & Komponen",
+    "87":"Kendaraan Bermotor","88":"Pesawat Udara & Komponen",
+    "89":"Kapal & Perahu","90":"Instrumen Optik & Medis",
+    "91":"Jam & Arloji","92":"Instrumen Musik","93":"Senjata & Amunisi",
+    "94":"Furnitur & Perlengkapan","95":"Mainan & Perlengkapan Olahraga",
+    "96":"Produk Manufaktur Lainnya","97":"Karya Seni & Antik","99":"Barang Lainnya",
+}
 
 BOP_MAIN_ITEMS = {
     1:"Transaksi Berjalan", 2:"Barang", 17:"Jasa",
@@ -80,7 +109,6 @@ _NEGARA_KW = {
 #  FUNGSI UI KHUSUS (REPLIKASI GAYA DASH)
 # ─────────────────────────────────────────────────────────────────
 def kpi_card(title, value, color, sub_text=""):
-    """Fungsi untuk membuat kotak KPI mirip desain Dash (garis warna di atas)."""
     st.markdown(f"""
         <div style="border: 1px solid rgba(128,128,128,0.2); border-top: 3px solid {color}; 
                     padding: 15px; border-radius: 6px; margin-bottom: 15px;">
@@ -91,7 +119,6 @@ def kpi_card(title, value, color, sub_text=""):
     """, unsafe_allow_html=True)
 
 def section_title(title):
-    """Fungsi untuk judul sub-bagian kecil seperti di Dash."""
     st.markdown(f"<p style='font-size:11px; font-weight:bold; letter-spacing:1px; margin-bottom:0px;'>{title}</p>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────
@@ -291,20 +318,20 @@ if not df_bps.empty:
     kmd = df_bps_clean.groupby("kodehs", as_index=False)[["value","berat"]].sum().sort_values("value", ascending=False)
     neg = df_bps_clean.groupby("negara", as_index=False)["value"].sum().sort_values("value", ascending=False)
     kmd["deskripsi"] = kmd["kodehs"].map(HS_DESC).fillna("Lainnya")
+    # FIX: Membuat kolom label gabungan (HS + Deskripsi)
+    kmd["label"] = kmd["kodehs"].astype(str) + " - " + kmd["deskripsi"].str[:15]
 
 # ── TAB 1: Ringkasan ──
 with tab1:
     if df_bps.empty:
         st.info("👈 Silakan atur filter dan tekan tombol 'MUAT BPS' pada sidebar.")
     else:
-        # Replikasi Grid KPI Cards Dash
         k1, k2, k3 = st.columns(3)
         c_green = "#3fb950" if meta['sumber'] == "Ekspor" else "#f78166"
         with k1: kpi_card(f"TOTAL {meta['sumber'].upper()}", f"{df_bps_clean['value'].sum():,.2f} {meta['unit']}", c_green)
         with k2: kpi_card("KOMODITAS TERBESAR (HS)", kmd.iloc[0]["kodehs"] if not kmd.empty else "-", "#58a6ff")
         with k3: kpi_card("NEGARA TUJUAN/ASAL UTAMA", neg.iloc[0]["negara"] if not neg.empty else "-", "#e3b341")
         
-        # Grid Historis (Atas)
         st.markdown("<hr style='margin: 10px 0;'>", unsafe_allow_html=True)
         section_title(f"HISTORIS TREN ({TAHUN_TERSEDIA[0]}–{TAHUN_SAAT_INI})")
         
@@ -329,20 +356,27 @@ with tab1:
                         fig_hist = px.line(df_h, x="Tahun", y="Value", markers=True, title=f"YoY (%) – HS {hs_hist}")
                     else:
                         fig_hist = px.line(df_h, x="Tahun", y="Value", markers=True, title=f"Tren Nilai ({meta['unit']}) – HS {hs_hist}")
+                    
+                    # FIX: Pastikan axis x adalah kategori
+                    fig_hist.update_layout(xaxis=dict(type='category'))
                     st.plotly_chart(fig_hist, use_container_width=True, theme="streamlit")
         
-        # Grid Charts Kiri-Kanan (Bawah)
         st.markdown("<hr style='margin: 10px 0;'>", unsafe_allow_html=True)
         c_left, c_right = st.columns(2)
         with c_left:
             section_title("TOP 15 KOMODITAS (HS)")
-            fig_kmd = px.bar(kmd.head(15), y="kodehs", x="value", orientation='h').update_yaxes(categoryorder='total ascending').update_layout(margin=dict(l=0, r=0, t=30, b=0), height=350)
+            # FIX: Gunakan y="label" dan paksa category
+            fig_kmd = px.bar(kmd.head(15), y="label", x="value", orientation='h')
+            fig_kmd.update_yaxes(categoryorder='total ascending', type='category')
+            fig_kmd.update_layout(margin=dict(l=0, r=0, t=30, b=0), height=350)
             fig_kmd.update_traces(marker_color=c_green)
             st.plotly_chart(fig_kmd, use_container_width=True)
             
         with c_right:
             section_title("TOP NEGARA MITRA")
-            fig_neg = px.bar(neg.head(15), y="negara", x="value", orientation='h').update_yaxes(categoryorder='total ascending').update_layout(margin=dict(l=0, r=0, t=30, b=0), height=350)
+            fig_neg = px.bar(neg.head(15), y="negara", x="value", orientation='h')
+            fig_neg.update_yaxes(categoryorder='total ascending', type='category')
+            fig_neg.update_layout(margin=dict(l=0, r=0, t=30, b=0), height=350)
             fig_neg.update_traces(marker_color="#58a6ff")
             st.plotly_chart(fig_neg, use_container_width=True)
 
@@ -370,13 +404,15 @@ with tab3:
         
         def highlight_ews(val):
             color = ''
-            if 'Atas' in str(val): color = '#ffcccb' # Light red for dark/light mode
-            elif 'Bawah' in str(val): color = '#ffe8b5' # Light yellow
-            elif 'Harga' in str(val): color = '#dcbdfb' # Light purple
-            elif 'KRITIS' in str(val): color = '#ff7b72' # Strong red
+            if 'Atas' in str(val): color = '#ffcccb' 
+            elif 'Bawah' in str(val): color = '#ffe8b5'
+            elif 'Harga' in str(val): color = '#dcbdfb'
+            elif 'KRITIS' in str(val): color = '#ff7b72'
             return f'background-color: {color}; color: black'
         
-        st.dataframe(ews_df.style.map(highlight_ews, subset=['status_ews']), use_container_width=True, hide_index=True)
+        # Sembunyikan kolom "label" yang dibuat untuk plot
+        cols_to_show = [c for c in ews_df.columns if c != "label"]
+        st.dataframe(ews_df[cols_to_show].style.map(highlight_ews, subset=['status_ews']), use_container_width=True, hide_index=True)
 
 # ── TAB 4: Mirroring ──
 with tab4:
@@ -387,7 +423,7 @@ with tab4:
     with col_m1: mitra_mirror = st.selectbox("Mitra Dagang", PARTNER_LIST)
     with col_m2: unit_mirror = st.radio("Satuan Mirroring", ["USD", "Juta USD"], horizontal=True)
     with col_m3: 
-        st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True) # Spacer
+        st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True) 
         btn_mirror = st.button("▶ JALANKAN", type="primary", use_container_width=True)
         
     if btn_mirror:
@@ -417,23 +453,31 @@ with tab4:
                         with cg1:
                             section_title("10 HS TERBESAR BPS")
                             top10 = df_merge.nlargest(10, "BPS_Value").copy()
+                            # FIX: Buat label spesifik dan wajibkan tipe 'category'
+                            top10["label"] = top10["HS"].astype(str) + " - " + top10["Deskripsi"].str[:15]
                             fig_cmp = go.Figure([
-                                go.Bar(name="BPS", x=top10["HS"], y=top10["BPS_Value"], marker_color="#3fb950"),
-                                go.Bar(name="Trade Map", x=top10["HS"], y=top10["Trademap_Value"], marker_color="#f78166"),
-                            ]).update_layout(barmode="group", height=320, margin=dict(l=0, r=0, t=30, b=0), legend=dict(orientation="h", y=1.1))
+                                go.Bar(name="BPS", x=top10["label"], y=top10["BPS_Value"], marker_color="#3fb950"),
+                                go.Bar(name="Trade Map", x=top10["label"], y=top10["Trademap_Value"], marker_color="#f78166"),
+                            ]).update_layout(barmode="group", height=320, margin=dict(l=0, r=0, t=30, b=0), 
+                                             legend=dict(orientation="h", y=1.1),
+                                             xaxis=dict(type='category')) # Paksa sumbu x jadi diskrit
                             st.plotly_chart(fig_cmp, use_container_width=True)
                         with cg2:
                             section_title("5 HS ASIMETRI TERBESAR")
                             top5 = df_merge.assign(Abs_Diff=df_merge["Selisih"].abs()).nlargest(5, "Abs_Diff")
+                            top5["label"] = top5["HS"].astype(str) + " - " + top5["Deskripsi"].str[:15]
                             fig_diff = go.Figure([
-                                go.Bar(name="BPS", x=top5["HS"], y=top5["BPS_Value"], marker_color="#3fb950"),
-                                go.Bar(name="Trade Map", x=top5["HS"], y=top5["Trademap_Value"], marker_color="#f78166"),
-                            ]).update_layout(barmode="group", height=320, margin=dict(l=0, r=0, t=30, b=0), legend=dict(orientation="h", y=1.1))
+                                go.Bar(name="BPS", x=top5["label"], y=top5["BPS_Value"], marker_color="#3fb950"),
+                                go.Bar(name="Trade Map", x=top5["label"], y=top5["Trademap_Value"], marker_color="#f78166"),
+                            ]).update_layout(barmode="group", height=320, margin=dict(l=0, r=0, t=30, b=0), 
+                                             legend=dict(orientation="h", y=1.1),
+                                             xaxis=dict(type='category')) # Paksa sumbu x jadi diskrit
                             st.plotly_chart(fig_diff, use_container_width=True)
                             
                     else: st.error(f"Gagal memuat Trade Map: {status}")
                 except Exception as e:
                     st.error(f"Kesalahan mirroring: {str(e)}")
+                    st.code(traceback.format_exc())
         else:
             st.warning("Muat data BPS di Sidebar terlebih dahulu!")
 
@@ -472,17 +516,19 @@ with tab5:
                 cc1, cc2 = st.columns([3, 2])
                 with cc1:
                     section_title("TREN TRANSAKSI BERJALAN & KOMPONEN")
-                    ca_df = df_seki[df_seki['item_id'].isin([2, 17, 20, 23, 1])] # Komponen + Total
+                    ca_df = df_seki[df_seki['item_id'].isin([2, 17, 20, 23, 1])] 
                     fig_ca = px.bar(ca_df[ca_df['item_id']!=1], x="period" if f_val=="quarterly" else "year", y="nilai", color="keterangan", barmode="relative")
                     fig_ca.add_scatter(x=ca_df[ca_df['item_id']==1]["period" if f_val=="quarterly" else "year"], y=ca_df[ca_df['item_id']==1]["nilai"], name="Total CA", line=dict(color="#000000", width=2))
                     fig_ca.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0), legend=dict(orientation="h", y=1.1, title=""))
+                    # FIX categorical axis for period
+                    fig_ca.update_layout(xaxis=dict(type='category'))
                     st.plotly_chart(fig_ca, use_container_width=True)
                 with cc2:
                     section_title("CADANGAN DEVISA")
                     cad_df = df_seki[df_seki['item_id'] == 54]
                     fig_cad = px.area(cad_df, x="period" if f_val=="quarterly" else "year", y="nilai")
                     fig_cad.update_traces(line_color="#39d0d8", fillcolor="rgba(57,208,216,0.1)")
-                    fig_cad.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0))
+                    fig_cad.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0), xaxis=dict(type='category'))
                     st.plotly_chart(fig_cad, use_container_width=True)
             else:
                 st.warning("Tidak ada data SEKI untuk rentang waktu tersebut.")
