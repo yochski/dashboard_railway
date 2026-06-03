@@ -1,6 +1,6 @@
 """
 Ultimate Dashboard Ekspor-Impor Indonesia + Neraca Pembayaran SEKI BI
-Versi: Streamlit (UI/UX Refined + Categorical Axis Fix)
+Versi: Streamlit (Final - UI Refined, Categorical Axis, SEKI DB Fixed)
 """
 
 import os, re, sqlite3, io
@@ -19,6 +19,7 @@ import traceback
 # ─────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Trade Intelligence | NEXOS", layout="wide", page_icon="📊")
 
+# ID File Google Drive
 GDRIVE_FILE_ID = "1IhKP7Jw7xhRPDzvw4CY7FVvK0lO_biy_"
 GDRIVE_URL = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
 
@@ -27,6 +28,7 @@ BPS_DB_PATH  = os.path.join(DATA_DIR, os.environ.get("BPS_DB_FILE", "ekspor_impo
 BOP_DB_PATH  = os.path.join(DATA_DIR, os.environ.get("BOP_DB_FILE", "bop_indonesia.db"))
 TM_XLSX      = os.path.join(DATA_DIR, os.environ.get("TM_XLSX_FILE", "data_trademap.xlsx"))
 
+# Nama tabel sesuai dengan database BPS Anda
 BPS_TABLE    = "exim_data" 
 
 HS_ALL       = [str(i).zfill(2) for i in range(1, 100)]
@@ -111,7 +113,7 @@ _NEGARA_KW = {
 def kpi_card(title, value, color, sub_text=""):
     st.markdown(f"""
         <div style="border: 1px solid rgba(128,128,128,0.2); border-top: 3px solid {color}; 
-                    padding: 15px; border-radius: 6px; margin-bottom: 15px;">
+                    padding: 15px; border-radius: 6px; margin-bottom: 15px; background-color: transparent;">
             <div style="font-size: 11px; color: gray; letter-spacing: 1px;">{title}</div>
             <div style="font-size: 22px; font-weight: bold; color: {color}; margin-top: 5px;">{value}</div>
             <div style="font-size: 11px; color: gray; margin-top: 5px;">{sub_text}</div>
@@ -122,7 +124,7 @@ def section_title(title):
     st.markdown(f"<p style='font-size:11px; font-weight:bold; letter-spacing:1px; margin-bottom:0px;'>{title}</p>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────
-#  FUNGSI DOWNLOAD & DATA
+#  FUNGSI DOWNLOAD & DATA BPS
 # ─────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def download_bps_database():
@@ -199,6 +201,9 @@ def fetch_hist_bps_db(sumber, hs, tipe, bulan=""):
     except Exception as e:
         return pd.DataFrame()
 
+# ─────────────────────────────────────────────────────────────────
+#  FUNGSI MIRRORING & SEKI BI
+# ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def load_trademap(mitra, tahun, sumber):
     if not os.path.exists(TM_XLSX): return pd.DataFrame(), "FILE_NOT_FOUND"
@@ -233,6 +238,19 @@ def bop_query(sql, params=()):
             return pd.read_sql_query(sql, conn, params=params)
     except Exception:
         return pd.DataFrame()
+
+# MENAMBAHKAN FUNGSI BOP LATEST YANG HILANG SEBELUMNYA
+def bop_latest():
+    df = bop_query("""SELECT period FROM bop_quarterly
+                      WHERE value_mn_usd IS NOT NULL
+                      ORDER BY year DESC, quarter DESC LIMIT 1""")
+    return df["period"].iloc[0] if not df.empty else "-"
+
+def bop_latest_val(item_id):
+    df = bop_query("""SELECT value_mn_usd FROM bop_quarterly
+                      WHERE item_id=? AND value_mn_usd IS NOT NULL
+                      ORDER BY year DESC, quarter DESC LIMIT 1""", (item_id,))
+    return float(df["value_mn_usd"].iloc[0]) if not df.empty else None
 
 def bop_series(item_ids, y1, y2, freq):
     ph = ",".join("?" * len(item_ids))
@@ -318,7 +336,7 @@ if not df_bps.empty:
     kmd = df_bps_clean.groupby("kodehs", as_index=False)[["value","berat"]].sum().sort_values("value", ascending=False)
     neg = df_bps_clean.groupby("negara", as_index=False)["value"].sum().sort_values("value", ascending=False)
     kmd["deskripsi"] = kmd["kodehs"].map(HS_DESC).fillna("Lainnya")
-    # FIX: Membuat kolom label gabungan (HS + Deskripsi)
+    # Membuat kolom label gabungan khusus Plotly
     kmd["label"] = kmd["kodehs"].astype(str) + " - " + kmd["deskripsi"].str[:15]
 
 # ── TAB 1: Ringkasan ──
@@ -357,7 +375,6 @@ with tab1:
                     else:
                         fig_hist = px.line(df_h, x="Tahun", y="Value", markers=True, title=f"Tren Nilai ({meta['unit']}) – HS {hs_hist}")
                     
-                    # FIX: Pastikan axis x adalah kategori
                     fig_hist.update_layout(xaxis=dict(type='category'))
                     st.plotly_chart(fig_hist, use_container_width=True, theme="streamlit")
         
@@ -365,7 +382,6 @@ with tab1:
         c_left, c_right = st.columns(2)
         with c_left:
             section_title("TOP 15 KOMODITAS (HS)")
-            # FIX: Gunakan y="label" dan paksa category
             fig_kmd = px.bar(kmd.head(15), y="label", x="value", orientation='h')
             fig_kmd.update_yaxes(categoryorder='total ascending', type='category')
             fig_kmd.update_layout(margin=dict(l=0, r=0, t=30, b=0), height=350)
@@ -410,7 +426,6 @@ with tab3:
             elif 'KRITIS' in str(val): color = '#ff7b72'
             return f'background-color: {color}; color: black'
         
-        # Sembunyikan kolom "label" yang dibuat untuk plot
         cols_to_show = [c for c in ews_df.columns if c != "label"]
         st.dataframe(ews_df[cols_to_show].style.map(highlight_ews, subset=['status_ews']), use_container_width=True, hide_index=True)
 
@@ -453,14 +468,13 @@ with tab4:
                         with cg1:
                             section_title("10 HS TERBESAR BPS")
                             top10 = df_merge.nlargest(10, "BPS_Value").copy()
-                            # FIX: Buat label spesifik dan wajibkan tipe 'category'
                             top10["label"] = top10["HS"].astype(str) + " - " + top10["Deskripsi"].str[:15]
                             fig_cmp = go.Figure([
                                 go.Bar(name="BPS", x=top10["label"], y=top10["BPS_Value"], marker_color="#3fb950"),
                                 go.Bar(name="Trade Map", x=top10["label"], y=top10["Trademap_Value"], marker_color="#f78166"),
                             ]).update_layout(barmode="group", height=320, margin=dict(l=0, r=0, t=30, b=0), 
                                              legend=dict(orientation="h", y=1.1),
-                                             xaxis=dict(type='category')) # Paksa sumbu x jadi diskrit
+                                             xaxis=dict(type='category')) # Paksa sumbu x diskrit/kategorikal
                             st.plotly_chart(fig_cmp, use_container_width=True)
                         with cg2:
                             section_title("5 HS ASIMETRI TERBESAR")
@@ -471,10 +485,16 @@ with tab4:
                                 go.Bar(name="Trade Map", x=top5["label"], y=top5["Trademap_Value"], marker_color="#f78166"),
                             ]).update_layout(barmode="group", height=320, margin=dict(l=0, r=0, t=30, b=0), 
                                              legend=dict(orientation="h", y=1.1),
-                                             xaxis=dict(type='category')) # Paksa sumbu x jadi diskrit
+                                             xaxis=dict(type='category'))
                             st.plotly_chart(fig_diff, use_container_width=True)
                             
-                    else: st.error(f"Gagal memuat Trade Map: {status}")
+                    elif status == "FILE_NOT_FOUND":
+                        st.error("❌ File 'data_trademap.xlsx' tidak ditemukan.")
+                    elif status.startswith("DATA_EMPTY_TAHUN"):
+                        tahun_ada = status.split("|")[1] if "|" in status else "-"
+                        st.warning(f"⚠️ Data Trade Map untuk '{mitra_mirror}' tahun {meta['tahun']} belum ada. Tahun di Excel: {tahun_ada}")
+                    else:
+                        st.error(f"Gagal memuat Trade Map: {status}")
                 except Exception as e:
                     st.error(f"Kesalahan mirroring: {str(e)}")
                     st.code(traceback.format_exc())
@@ -508,10 +528,20 @@ with tab5:
                 df_seki["nilai"] = df_seki["value_mn_usd"] / div_s
                 
                 ck1, ck2, ck3 = st.columns(3)
+                
+                # Fetch Latest Values
                 ca_v = bop_latest_val(1)
-                with ck1: kpi_card("TRANSAKSI BERJALAN", f"{(kv:=bop_latest_val(1)/div_s if bop_latest_val(1) else 0):,.1f}", "#3fb950" if kv >= 0 else "#f78166", "Terbaru")
-                with ck2: kpi_card("CADANGAN DEVISA", f"{(bop_latest_val(54)/div_s if bop_latest_val(54) else 0):,.1f}", "#58a6ff", "Terbaru")
-                with ck3: kpi_card("NERACA KESELURUHAN", f"{(bop_latest_val(48)/div_s if bop_latest_val(48) else 0):,.1f}", "#bc8cff", "Terbaru")
+                cad_v = bop_latest_val(54)
+                ner_v = bop_latest_val(48)
+                _BOP_LATEST = bop_latest()
+                
+                ca_val_disp = ca_v/div_s if ca_v else 0
+                cad_val_disp = cad_v/div_s if cad_v else 0
+                ner_val_disp = ner_v/div_s if ner_v else 0
+                
+                with ck1: kpi_card("TRANSAKSI BERJALAN", f"{ca_val_disp:,.1f}", "#3fb950" if ca_val_disp >= 0 else "#f78166", f"Periode: {_BOP_LATEST}")
+                with ck2: kpi_card("CADANGAN DEVISA", f"{cad_val_disp:,.1f}", "#58a6ff", f"Periode: {_BOP_LATEST}")
+                with ck3: kpi_card("NERACA KESELURUHAN", f"{ner_val_disp:,.1f}", "#bc8cff", f"Periode: {_BOP_LATEST}")
 
                 cc1, cc2 = st.columns([3, 2])
                 with cc1:
@@ -519,9 +549,7 @@ with tab5:
                     ca_df = df_seki[df_seki['item_id'].isin([2, 17, 20, 23, 1])] 
                     fig_ca = px.bar(ca_df[ca_df['item_id']!=1], x="period" if f_val=="quarterly" else "year", y="nilai", color="keterangan", barmode="relative")
                     fig_ca.add_scatter(x=ca_df[ca_df['item_id']==1]["period" if f_val=="quarterly" else "year"], y=ca_df[ca_df['item_id']==1]["nilai"], name="Total CA", line=dict(color="#000000", width=2))
-                    fig_ca.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0), legend=dict(orientation="h", y=1.1, title=""))
-                    # FIX categorical axis for period
-                    fig_ca.update_layout(xaxis=dict(type='category'))
+                    fig_ca.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0), legend=dict(orientation="h", y=1.1, title=""), xaxis=dict(type='category'))
                     st.plotly_chart(fig_ca, use_container_width=True)
                 with cc2:
                     section_title("CADANGAN DEVISA")
