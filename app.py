@@ -1,6 +1,6 @@
 """
 Ultimate Dashboard Ekspor-Impor Indonesia + Neraca Pembayaran SEKI BI
-Versi: Streamlit (Final - UI Refined, Categorical Axis, SEKI DB Fixed)
+Versi: Streamlit (Full Restoration to Dash Parity)
 """
 
 import os, re, sqlite3, io
@@ -19,7 +19,6 @@ import traceback
 # ─────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Trade Intelligence | NEXOS", layout="wide", page_icon="📊")
 
-# ID File Google Drive
 GDRIVE_FILE_ID = "1IhKP7Jw7xhRPDzvw4CY7FVvK0lO_biy_"
 GDRIVE_URL = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
 
@@ -28,7 +27,6 @@ BPS_DB_PATH  = os.path.join(DATA_DIR, os.environ.get("BPS_DB_FILE", "ekspor_impo
 BOP_DB_PATH  = os.path.join(DATA_DIR, os.environ.get("BOP_DB_FILE", "bop_indonesia.db"))
 TM_XLSX      = os.path.join(DATA_DIR, os.environ.get("TM_XLSX_FILE", "data_trademap.xlsx"))
 
-# Nama tabel sesuai dengan database BPS Anda
 BPS_TABLE    = "exim_data" 
 
 HS_ALL       = [str(i).zfill(2) for i in range(1, 100)]
@@ -121,7 +119,7 @@ def kpi_card(title, value, color, sub_text=""):
     """, unsafe_allow_html=True)
 
 def section_title(title):
-    st.markdown(f"<p style='font-size:11px; font-weight:bold; letter-spacing:1px; margin-bottom:0px;'>{title}</p>", unsafe_allow_html=True)
+    st.markdown(f"<p style='font-size:11px; font-weight:bold; letter-spacing:1px; margin-bottom:0px; text-transform:uppercase;'>{title}</p>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────
 #  FUNGSI DOWNLOAD & DATA BPS
@@ -239,7 +237,6 @@ def bop_query(sql, params=()):
     except Exception:
         return pd.DataFrame()
 
-# MENAMBAHKAN FUNGSI BOP LATEST YANG HILANG SEBELUMNYA
 def bop_latest():
     df = bop_query("""SELECT period FROM bop_quarterly
                       WHERE value_mn_usd IS NOT NULL
@@ -336,7 +333,6 @@ if not df_bps.empty:
     kmd = df_bps_clean.groupby("kodehs", as_index=False)[["value","berat"]].sum().sort_values("value", ascending=False)
     neg = df_bps_clean.groupby("negara", as_index=False)["value"].sum().sort_values("value", ascending=False)
     kmd["deskripsi"] = kmd["kodehs"].map(HS_DESC).fillna("Lainnya")
-    # Membuat kolom label gabungan khusus Plotly
     kmd["label"] = kmd["kodehs"].astype(str) + " - " + kmd["deskripsi"].str[:15]
 
 # ── TAB 1: Ringkasan ──
@@ -344,6 +340,7 @@ with tab1:
     if df_bps.empty:
         st.info("👈 Silakan atur filter dan tekan tombol 'MUAT BPS' pada sidebar.")
     else:
+        # Row 1: KPI
         k1, k2, k3 = st.columns(3)
         c_green = "#3fb950" if meta['sumber'] == "Ekspor" else "#f78166"
         with k1: kpi_card(f"TOTAL {meta['sumber'].upper()}", f"{df_bps_clean['value'].sum():,.2f} {meta['unit']}", c_green)
@@ -351,50 +348,61 @@ with tab1:
         with k3: kpi_card("NEGARA TUJUAN/ASAL UTAMA", neg.iloc[0]["negara"] if not neg.empty else "-", "#e3b341")
         
         st.markdown("<hr style='margin: 10px 0;'>", unsafe_allow_html=True)
-        section_title(f"HISTORIS TREN ({TAHUN_TERSEDIA[0]}–{TAHUN_SAAT_INI})")
         
-        h1, h2, h3, h4 = st.columns([2, 2, 2, 1])
-        hs_hist = h1.selectbox("Pilih HS untuk Histori", options=HS_ALL, index=26, label_visibility="collapsed")
-        negara_hist = h2.selectbox("Filter Negara", options=["Semua Negara"] + PARTNER_LIST, label_visibility="collapsed")
-        metric_hist = h3.radio("Metrik Histori", ["Nilai", "YoY %"], horizontal=True, label_visibility="collapsed")
-        btn_hist = h4.button("Tampilkan Histori", use_container_width=True)
-        
-        if btn_hist:
-            with st.spinner("Menarik data historis..."):
-                df_hist_raw = fetch_hist_bps_db(meta['sumber_kode'], hs_hist, meta['tipe'], meta['bulan'])
-                if df_hist_raw.empty:
-                    st.warning("Tidak ada data historis.")
-                else:
-                    if negara_hist != "Semua Negara": df_hist_raw = df_hist_raw[df_hist_raw["negara"] == normalize_negara(negara_hist)]
-                    df_h = df_hist_raw.groupby("tahun", as_index=False)["value"].sum().sort_values("tahun")
-                    df_h["Tahun"], df_h["Value"] = df_h["tahun"].astype(str), df_h["value"] / div
-                    
-                    if metric_hist == "YoY %":
-                        df_h["Value"] = df_h["Value"].pct_change() * 100
-                        fig_hist = px.line(df_h, x="Tahun", y="Value", markers=True, title=f"YoY (%) – HS {hs_hist}")
+        # Row 2: Historis & Top 15
+        r1_left, r1_right = st.columns(2)
+        with r1_left:
+            section_title(f"HISTORIS TREN ({TAHUN_TERSEDIA[0]}–{TAHUN_SAAT_INI})")
+            h1, h2, h3, h4 = st.columns([2, 2, 2, 2])
+            hs_hist = h1.selectbox("Pilih HS untuk Histori", options=HS_ALL, index=26, label_visibility="collapsed")
+            negara_hist = h2.selectbox("Filter Negara", options=["Semua Negara"] + PARTNER_LIST, label_visibility="collapsed")
+            metric_hist = h3.radio("Metrik Histori", ["Nilai", "YoY %"], horizontal=True, label_visibility="collapsed")
+            btn_hist = h4.button("Tampilkan Histori", use_container_width=True)
+            
+            if btn_hist:
+                with st.spinner("Menarik data historis..."):
+                    df_hist_raw = fetch_hist_bps_db(meta['sumber_kode'], hs_hist, meta['tipe'], meta['bulan'])
+                    if df_hist_raw.empty:
+                        st.warning("Tidak ada data historis.")
                     else:
-                        fig_hist = px.line(df_h, x="Tahun", y="Value", markers=True, title=f"Tren Nilai ({meta['unit']}) – HS {hs_hist}")
-                    
-                    fig_hist.update_layout(xaxis=dict(type='category'))
-                    st.plotly_chart(fig_hist, use_container_width=True, theme="streamlit")
+                        if negara_hist != "Semua Negara": df_hist_raw = df_hist_raw[df_hist_raw["negara"] == normalize_negara(negara_hist)]
+                        df_h = df_hist_raw.groupby("tahun", as_index=False)["value"].sum().sort_values("tahun")
+                        df_h["Tahun"], df_h["Value"] = df_h["tahun"].astype(str), df_h["value"] / div
+                        
+                        if metric_hist == "YoY %":
+                            df_h["Value"] = df_h["Value"].pct_change() * 100
+                            fig_hist = px.line(df_h, x="Tahun", y="Value", markers=True, title=f"YoY (%) – HS {hs_hist}")
+                        else:
+                            fig_hist = px.line(df_h, x="Tahun", y="Value", markers=True, title=f"Tren Nilai ({meta['unit']}) – HS {hs_hist}")
+                        
+                        fig_hist.update_layout(xaxis=dict(type='category'), margin=dict(l=0, r=0, t=30, b=0))
+                        st.plotly_chart(fig_hist, use_container_width=True)
         
-        st.markdown("<hr style='margin: 10px 0;'>", unsafe_allow_html=True)
-        c_left, c_right = st.columns(2)
-        with c_left:
+        with r1_right:
             section_title("TOP 15 KOMODITAS (HS)")
             fig_kmd = px.bar(kmd.head(15), y="label", x="value", orientation='h')
             fig_kmd.update_yaxes(categoryorder='total ascending', type='category')
             fig_kmd.update_layout(margin=dict(l=0, r=0, t=30, b=0), height=350)
             fig_kmd.update_traces(marker_color=c_green)
             st.plotly_chart(fig_kmd, use_container_width=True)
-            
-        with c_right:
+        
+        st.markdown("<hr style='margin: 10px 0;'>", unsafe_allow_html=True)
+        
+        # Row 3: Top Negara & Share Pie
+        r2_left, r2_right = st.columns(2)
+        with r2_left:
             section_title("TOP NEGARA MITRA")
             fig_neg = px.bar(neg.head(15), y="negara", x="value", orientation='h')
             fig_neg.update_yaxes(categoryorder='total ascending', type='category')
             fig_neg.update_layout(margin=dict(l=0, r=0, t=30, b=0), height=350)
             fig_neg.update_traces(marker_color="#58a6ff")
             st.plotly_chart(fig_neg, use_container_width=True)
+            
+        with r2_right:
+            section_title("SHARE KOMODITAS (TOP 8)")
+            fig_pie = px.pie(kmd.head(8), values='value', names='label', hole=0.45)
+            fig_pie.update_layout(margin=dict(l=0, r=0, t=30, b=0), height=350, legend=dict(orientation="v"))
+            st.plotly_chart(fig_pie, use_container_width=True)
 
 # ── TAB 2: Data Lengkap ──
 with tab2:
@@ -434,12 +442,16 @@ with tab4:
     section_title("ANALISIS ASIMETRI PENCATATAN (BPS VS ITC TRADE MAP)")
     st.markdown("<br>", unsafe_allow_html=True)
     
+    if not df_bps.empty:
+        # Menambahkan konteks agar user tahu "Ekspor" atau "Impor" yang ditarik dari sidebar
+        st.info(f"ℹ️ Saat ini menganalisis asimetri **{meta.get('sumber', 'Ekspor/Impor')}** tahun **{meta.get('tahun', '-')}**. (Ubah pengaturan di sidebar kiri jika ingin mengganti sumber).")
+    
     col_m1, col_m2, col_m3 = st.columns([2, 2, 1])
     with col_m1: mitra_mirror = st.selectbox("Mitra Dagang", PARTNER_LIST)
     with col_m2: unit_mirror = st.radio("Satuan Mirroring", ["USD", "Juta USD"], horizontal=True)
     with col_m3: 
         st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True) 
-        btn_mirror = st.button("▶ JALANKAN", type="primary", use_container_width=True)
+        btn_mirror = st.button("▶ JALANKAN MIRRORING", type="primary", use_container_width=True)
         
     if btn_mirror:
         if not df_bps.empty:
@@ -459,10 +471,14 @@ with tab4:
                         
                         st.success("✅ Mirroring selesai.")
                         
+                        # Teks dinamis sesuai versi Dash
+                        lbl_bps = "EKSPOR IDN KE" if str(meta['sumber_kode']) == "1" else "IMPOR IDN DARI"
+                        lbl_tm  = "IMPOR MITRA DARI IDN" if str(meta['sumber_kode']) == "1" else "EKSPOR MITRA KE IDN"
+                        
                         cm1, cm2, cm3 = st.columns(3)
-                        with cm1: kpi_card(f"TOTAL BPS ({mitra_mirror})", f"{df_merge['BPS_Value'].sum():,.1f}", "#3fb950")
-                        with cm2: kpi_card("TOTAL TRADE MAP", f"{df_merge['Trademap_Value'].sum():,.1f}", "#58a6ff")
-                        with cm3: kpi_card("SELISIH ASIMETRI", f"{df_merge['Selisih'].sum():,.1f}", "#e3b341")
+                        with cm1: kpi_card(f"{lbl_bps} {mitra_mirror.upper()} (BPS)", f"{df_merge['BPS_Value'].sum():,.1f} {unit_mirror}", "#3fb950")
+                        with cm2: kpi_card(f"{lbl_tm} (TRADE MAP)", f"{df_merge['Trademap_Value'].sum():,.1f} {unit_mirror}", "#58a6ff")
+                        with cm3: kpi_card("TOTAL SELISIH ASIMETRI", f"{df_merge['Selisih'].sum():,.1f} {unit_mirror}", "#e3b341")
                         
                         cg1, cg2 = st.columns(2)
                         with cg1:
@@ -473,8 +489,7 @@ with tab4:
                                 go.Bar(name="BPS", x=top10["label"], y=top10["BPS_Value"], marker_color="#3fb950"),
                                 go.Bar(name="Trade Map", x=top10["label"], y=top10["Trademap_Value"], marker_color="#f78166"),
                             ]).update_layout(barmode="group", height=320, margin=dict(l=0, r=0, t=30, b=0), 
-                                             legend=dict(orientation="h", y=1.1),
-                                             xaxis=dict(type='category')) # Paksa sumbu x diskrit/kategorikal
+                                             legend=dict(orientation="h", y=1.1), xaxis=dict(type='category')) 
                             st.plotly_chart(fig_cmp, use_container_width=True)
                         with cg2:
                             section_title("5 HS ASIMETRI TERBESAR")
@@ -484,17 +499,23 @@ with tab4:
                                 go.Bar(name="BPS", x=top5["label"], y=top5["BPS_Value"], marker_color="#3fb950"),
                                 go.Bar(name="Trade Map", x=top5["label"], y=top5["Trademap_Value"], marker_color="#f78166"),
                             ]).update_layout(barmode="group", height=320, margin=dict(l=0, r=0, t=30, b=0), 
-                                             legend=dict(orientation="h", y=1.1),
-                                             xaxis=dict(type='category'))
+                                             legend=dict(orientation="h", y=1.1), xaxis=dict(type='category'))
                             st.plotly_chart(fig_diff, use_container_width=True)
                             
-                    elif status == "FILE_NOT_FOUND":
-                        st.error("❌ File 'data_trademap.xlsx' tidak ditemukan.")
+                        # MENGEMBALIKAN TABEL DATA LENGKAP & TOMBOL DOWNLOAD
+                        st.markdown("<hr style='margin: 10px 0;'>", unsafe_allow_html=True)
+                        st.markdown("<div style='display: flex; justify-content: space-between; align-items: center;'>", unsafe_allow_html=True)
+                        section_title("DATA LENGKAP ASIMETRI")
+                        csv_mirror = df_merge[["HS", "Deskripsi", "BPS_Value", "Trademap_Value", "Selisih"]].to_csv(index=False).encode('utf-8')
+                        st.download_button("⬇ Download CSV", data=csv_mirror, file_name=f"Mirroring_{mitra_mirror}_{meta['tahun']}.csv", mime='text/csv')
+                        st.markdown("</div>", unsafe_allow_html=True)
+                        st.dataframe(df_merge[["HS", "Deskripsi", "BPS_Value", "Trademap_Value", "Selisih"]], use_container_width=True, hide_index=True)
+                            
+                    elif status == "FILE_NOT_FOUND": st.error("❌ File 'data_trademap.xlsx' tidak ditemukan.")
                     elif status.startswith("DATA_EMPTY_TAHUN"):
                         tahun_ada = status.split("|")[1] if "|" in status else "-"
                         st.warning(f"⚠️ Data Trade Map untuk '{mitra_mirror}' tahun {meta['tahun']} belum ada. Tahun di Excel: {tahun_ada}")
-                    else:
-                        st.error(f"Gagal memuat Trade Map: {status}")
+                    else: st.error(f"Gagal memuat Trade Map: {status}")
                 except Exception as e:
                     st.error(f"Kesalahan mirroring: {str(e)}")
                     st.code(traceback.format_exc())
@@ -516,7 +537,7 @@ with tab5:
             unit_s = cs4.selectbox("Satuan", ["Juta USD", "Miliar USD"])
             
             cs5.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
-            sub_seki = cs5.form_submit_button("▶ TAMPILKAN", use_container_width=True)
+            sub_seki = cs5.form_submit_button("▶ TAMPILKAN NERACA", use_container_width=True)
             
         if sub_seki:
             f_val = "quarterly" if freq == "Kuartalan" else "annual"
@@ -528,35 +549,92 @@ with tab5:
                 df_seki["nilai"] = df_seki["value_mn_usd"] / div_s
                 
                 ck1, ck2, ck3 = st.columns(3)
+                ca_v, cad_v, ner_v, _BOP_LATEST = bop_latest_val(1), bop_latest_val(54), bop_latest_val(48), bop_latest()
                 
-                # Fetch Latest Values
-                ca_v = bop_latest_val(1)
-                cad_v = bop_latest_val(54)
-                ner_v = bop_latest_val(48)
-                _BOP_LATEST = bop_latest()
-                
-                ca_val_disp = ca_v/div_s if ca_v else 0
-                cad_val_disp = cad_v/div_s if cad_v else 0
-                ner_val_disp = ner_v/div_s if ner_v else 0
-                
-                with ck1: kpi_card("TRANSAKSI BERJALAN", f"{ca_val_disp:,.1f}", "#3fb950" if ca_val_disp >= 0 else "#f78166", f"Periode: {_BOP_LATEST}")
-                with ck2: kpi_card("CADANGAN DEVISA", f"{cad_val_disp:,.1f}", "#58a6ff", f"Periode: {_BOP_LATEST}")
-                with ck3: kpi_card("NERACA KESELURUHAN", f"{ner_val_disp:,.1f}", "#bc8cff", f"Periode: {_BOP_LATEST}")
+                with ck1: kpi_card("TRANSAKSI BERJALAN", f"{(ca_v/div_s if ca_v else 0):,.1f} {unit_s}", "#3fb950" if (ca_v or 0) >= 0 else "#f78166", f"Periode: {_BOP_LATEST}")
+                with ck2: kpi_card("CADANGAN DEVISA", f"{(cad_v/div_s if cad_v else 0):,.1f} {unit_s}", "#58a6ff", f"Periode: {_BOP_LATEST}")
+                with ck3: kpi_card("NERACA KESELURUHAN", f"{(ner_v/div_s if ner_v else 0):,.1f} {unit_s}", "#bc8cff", f"Periode: {_BOP_LATEST}")
+
+                # Fungsi Helper untuk Plotting SEKI
+                def gs(iid):
+                    s = df_seki[df_seki["item_id"] == iid].copy()
+                    s = s.sort_values("year" if f_val == "annual" else ["year","quarter"])
+                    s["v"] = s["nilai"]
+                    return s
+                xcol = "period" if f_val == "quarterly" else "year"
 
                 cc1, cc2 = st.columns([3, 2])
                 with cc1:
                     section_title("TREN TRANSAKSI BERJALAN & KOMPONEN")
                     ca_df = df_seki[df_seki['item_id'].isin([2, 17, 20, 23, 1])] 
-                    fig_ca = px.bar(ca_df[ca_df['item_id']!=1], x="period" if f_val=="quarterly" else "year", y="nilai", color="keterangan", barmode="relative")
-                    fig_ca.add_scatter(x=ca_df[ca_df['item_id']==1]["period" if f_val=="quarterly" else "year"], y=ca_df[ca_df['item_id']==1]["nilai"], name="Total CA", line=dict(color="#000000", width=2))
+                    fig_ca = px.bar(ca_df[ca_df['item_id']!=1], x=xcol, y="nilai", color="keterangan", barmode="relative")
+                    fig_ca.add_scatter(x=ca_df[ca_df['item_id']==1][xcol], y=ca_df[ca_df['item_id']==1]["nilai"], name="Total CA", line=dict(color="#000000", width=2))
                     fig_ca.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0), legend=dict(orientation="h", y=1.1, title=""), xaxis=dict(type='category'))
                     st.plotly_chart(fig_ca, use_container_width=True)
                 with cc2:
+                    section_title("DEKOMPOSISI NERACA (TOTAL PERIODE)")
+                    wf_ids = [1, 26, 29, 47, 48]
+                    wf_lbl = ["Transaksi<br>Berjalan","Transaksi<br>Modal","Transaksi<br>Finansial","Selisih<br>Perhitungan","Neraca<br>Keseluruhan"]
+                    wf_v = [float(gs(iid)["v"].sum()) if not gs(iid).empty else 0 for iid in wf_ids]
+                    fig_wf = go.Figure(go.Waterfall(x=wf_lbl, measure=["relative","relative","relative","relative","total"], y=wf_v, textposition="outside", decreasing=dict(marker_color="#f78166"), increasing=dict(marker_color="#3fb950"), totals=dict(marker_color="#bc8cff")))
+                    fig_wf.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0), showlegend=False)
+                    st.plotly_chart(fig_wf, use_container_width=True)
+
+                cd1, cd2 = st.columns(2)
+                with cd1:
+                    section_title("TRANSAKSI FINANSIAL: KOMPONEN INVESTASI")
+                    fig_inv = go.Figure()
+                    for iid, lbl_i, c in [(32,"FDI","#3fb950"),(35,"Portofolio","#58a6ff"),(41,"Lainnya","#ffa657"),(40,"Derivatif","#e3b341")]:
+                        s = gs(iid)
+                        if not s.empty: fig_inv.add_trace(go.Bar(x=s[xcol], y=s["v"], name=lbl_i, marker_color=c))
+                    s_fin = gs(29)
+                    if not s_fin.empty: fig_inv.add_trace(go.Scatter(x=s_fin[xcol], y=s_fin["v"], name="Total Fin.", line=dict(color="#bc8cff", width=2, dash="dot")))
+                    fig_inv.update_layout(barmode="relative", height=320, margin=dict(l=0, r=0, t=30, b=0), legend=dict(orientation="h", y=1.1), xaxis=dict(type='category'))
+                    st.plotly_chart(fig_inv, use_container_width=True)
+                with cd2:
                     section_title("CADANGAN DEVISA")
                     cad_df = df_seki[df_seki['item_id'] == 54]
-                    fig_cad = px.area(cad_df, x="period" if f_val=="quarterly" else "year", y="nilai")
+                    fig_cad = px.area(cad_df, x=xcol, y="nilai")
                     fig_cad.update_traces(line_color="#39d0d8", fillcolor="rgba(57,208,216,0.1)")
                     fig_cad.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0), xaxis=dict(type='category'))
                     st.plotly_chart(fig_cad, use_container_width=True)
+
+                ce1, ce2 = st.columns(2)
+                with ce1:
+                    section_title("KOMPARASI INDIKATOR")
+                    seki_cmp = st.multiselect("Pilih Indikator:", options=list(BOP_MAIN_ITEMS.values()), default=["Transaksi Finansial", "Neraca Keseluruhan"], label_visibility="collapsed")
+                    inv_map = {v: k for k, v in BOP_MAIN_ITEMS.items()}
+                    fig_cmp = go.Figure()
+                    pal = ["#58a6ff", "#3fb950", "#f78166", "#e3b341", "#bc8cff"]
+                    for i, ind in enumerate(seki_cmp):
+                        s = gs(inv_map[ind])
+                        if not s.empty: fig_cmp.add_trace(go.Scatter(x=s[xcol], y=s["v"], name=ind, mode="lines+markers", line=dict(color=pal[i%len(pal)], width=2)))
+                    fig_cmp.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0), legend=dict(orientation="h", y=1.1), xaxis=dict(type='category'))
+                    st.plotly_chart(fig_cmp, use_container_width=True)
+                with ce2:
+                    section_title("CURRENT ACCOUNT % PDB")
+                    s_pct = df_seki[df_seki["item_id"] == 56].copy().sort_values("year" if f_val == "annual" else ["year","quarter"])
+                    fig_pct = go.Figure()
+                    if not s_pct.empty:
+                        fig_pct.add_trace(go.Bar(x=s_pct[xcol], y=s_pct["value_mn_usd"], marker_color=["#3fb950" if v >= 0 else "#f78166" for v in s_pct["value_mn_usd"]]))
+                    fig_pct.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0), xaxis=dict(type='category'))
+                    st.plotly_chart(fig_pct, use_container_width=True)
+
+                # MENGEMBALIKAN TABEL DATA SEKI LENGKAP & TOMBOL DOWNLOAD
+                st.markdown("<hr style='margin: 10px 0;'>", unsafe_allow_html=True)
+                st.markdown("<div style='display: flex; justify-content: space-between; align-items: center;'>", unsafe_allow_html=True)
+                section_title("DATA LENGKAP NERACA PEMBAYARAN")
+                
+                # Filter Tabel
+                seki_tbl_filter = st.multiselect("Filter Indikator:", options=list(BOP_MAIN_ITEMS.values()), default=None, label_visibility="collapsed")
+                df_seki_table = df_seki.copy()
+                if seki_tbl_filter:
+                    df_seki_table = df_seki_table[df_seki_table["keterangan"].isin(seki_tbl_filter)]
+                
+                csv_seki = df_seki_table[["year", "period", "keterangan", "items_en", "nilai"]].to_csv(index=False).encode('utf-8')
+                st.download_button("⬇ Download CSV", data=csv_seki, file_name=f"SEKI_{y1}_{y2}.csv", mime='text/csv')
+                st.markdown("</div>", unsafe_allow_html=True)
+                
+                st.dataframe(df_seki_table[["year", "period", "keterangan", "items_en", "nilai"]], use_container_width=True, hide_index=True)
             else:
                 st.warning("Tidak ada data SEKI untuk rentang waktu tersebut.")
