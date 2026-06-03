@@ -1,6 +1,6 @@
 """
 Ultimate Dashboard Ekspor-Impor Indonesia + Neraca Pembayaran SEKI BI
-Versi: Streamlit (Full Restoration to Dash Parity)
+Versi: Streamlit (Auto-Load BPS, Full Features)
 """
 
 import os, re, sqlite3, io
@@ -19,6 +19,7 @@ import traceback
 # ─────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Trade Intelligence | NEXOS", layout="wide", page_icon="📊")
 
+# ID File Google Drive
 GDRIVE_FILE_ID = "1IhKP7Jw7xhRPDzvw4CY7FVvK0lO_biy_"
 GDRIVE_URL = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
 
@@ -27,6 +28,7 @@ BPS_DB_PATH  = os.path.join(DATA_DIR, os.environ.get("BPS_DB_FILE", "ekspor_impo
 BOP_DB_PATH  = os.path.join(DATA_DIR, os.environ.get("BOP_DB_FILE", "bop_indonesia.db"))
 TM_XLSX      = os.path.join(DATA_DIR, os.environ.get("TM_XLSX_FILE", "data_trademap.xlsx"))
 
+# Nama tabel sesuai dengan database BPS Anda
 BPS_TABLE    = "exim_data" 
 
 HS_ALL       = [str(i).zfill(2) for i in range(1, 100)]
@@ -296,25 +298,26 @@ with st.sidebar:
     else:
         st.error("❌ DB BPS Tidak Ditemukan")
 
-    with st.form("bps_form"):
-        f_tahun = st.selectbox("Tahun", reversed(TAHUN_TERSEDIA), index=1)
-        f_periode_label = st.selectbox("Periode", list(PERIODE_OPSI.keys()))
-        f_periode = PERIODE_OPSI[f_periode_label]
-        f_sumber_label = st.radio("Jenis Perdagangan", ["Ekspor", "Impor"])
-        f_sumber = "1" if f_sumber_label == "Ekspor" else "2"
-        f_unit = st.radio("Satuan", ["USD", "Miliar USD"])
-        
-        submitted = st.form_submit_button("▶ MUAT BPS", use_container_width=True)
-        if submitted:
-            tipe, bulan = get_periode_params(f_periode)
-            with st.spinner('Menarik data dari Database...'):
-                df_raw = fetch_bps_db(f_sumber, str(f_tahun), tipe, bulan)
-                if not df_raw.empty:
-                    st.session_state['bps_data'] = df_raw
-                    st.session_state['bps_meta'] = {"tahun": f_tahun, "sumber": f_sumber_label, "sumber_kode": f_sumber, "unit": f_unit, "tipe": tipe, "bulan": bulan}
-                    st.success(f"Berhasil memuat {len(df_raw):,} baris data.")
-                else:
-                    st.error(f"Tidak ada data BPS {f_sumber_label} {f_tahun} untuk filter tersebut.")
+    # WIDGET LANGSUNG (TANPA st.form) AGAR AUTO-LOAD
+    f_tahun = st.selectbox("Tahun", reversed(TAHUN_TERSEDIA), index=1)
+    f_periode_label = st.selectbox("Periode", list(PERIODE_OPSI.keys()))
+    f_periode = PERIODE_OPSI[f_periode_label]
+    f_sumber_label = st.radio("Jenis Perdagangan", ["Ekspor", "Impor"])
+    f_sumber = "1" if f_sumber_label == "Ekspor" else "2"
+    f_unit = st.radio("Satuan", ["USD", "Miliar USD"])
+    
+    # OTOMATIS MEMUAT DATA KETIKA FILTER DIUBAH
+    tipe, bulan = get_periode_params(f_periode)
+    with st.spinner('Menyiapkan data BPS...'):
+        df_raw = fetch_bps_db(f_sumber, str(f_tahun), tipe, bulan)
+        if not df_raw.empty:
+            st.session_state['bps_data'] = df_raw
+            st.session_state['bps_meta'] = {"tahun": f_tahun, "sumber": f_sumber_label, "sumber_kode": f_sumber, "unit": f_unit, "tipe": tipe, "bulan": bulan}
+            st.success(f"Berhasil memuat {len(df_raw):,} baris data.")
+        else:
+            st.session_state['bps_data'] = pd.DataFrame()
+            st.session_state['bps_meta'] = {}
+            st.error(f"Tidak ada data BPS {f_sumber_label} {f_tahun} untuk filter tersebut.")
 
 # ── Tabs Setup ──
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -338,7 +341,7 @@ if not df_bps.empty:
 # ── TAB 1: Ringkasan ──
 with tab1:
     if df_bps.empty:
-        st.info("👈 Silakan atur filter dan tekan tombol 'MUAT BPS' pada sidebar.")
+        st.info("👈 Silakan atur filter pada sidebar di sebelah kiri.")
     else:
         # Row 1: KPI
         k1, k2, k3 = st.columns(3)
@@ -443,7 +446,6 @@ with tab4:
     st.markdown("<br>", unsafe_allow_html=True)
     
     if not df_bps.empty:
-        # Menambahkan konteks agar user tahu "Ekspor" atau "Impor" yang ditarik dari sidebar
         st.info(f"ℹ️ Saat ini menganalisis asimetri **{meta.get('sumber', 'Ekspor/Impor')}** tahun **{meta.get('tahun', '-')}**. (Ubah pengaturan di sidebar kiri jika ingin mengganti sumber).")
     
     col_m1, col_m2, col_m3 = st.columns([2, 2, 1])
@@ -471,7 +473,6 @@ with tab4:
                         
                         st.success("✅ Mirroring selesai.")
                         
-                        # Teks dinamis sesuai versi Dash
                         lbl_bps = "EKSPOR IDN KE" if str(meta['sumber_kode']) == "1" else "IMPOR IDN DARI"
                         lbl_tm  = "IMPOR MITRA DARI IDN" if str(meta['sumber_kode']) == "1" else "EKSPOR MITRA KE IDN"
                         
@@ -502,7 +503,6 @@ with tab4:
                                              legend=dict(orientation="h", y=1.1), xaxis=dict(type='category'))
                             st.plotly_chart(fig_diff, use_container_width=True)
                             
-                        # MENGEMBALIKAN TABEL DATA LENGKAP & TOMBOL DOWNLOAD
                         st.markdown("<hr style='margin: 10px 0;'>", unsafe_allow_html=True)
                         st.markdown("<div style='display: flex; justify-content: space-between; align-items: center;'>", unsafe_allow_html=True)
                         section_title("DATA LENGKAP ASIMETRI")
@@ -555,7 +555,6 @@ with tab5:
                 with ck2: kpi_card("CADANGAN DEVISA", f"{(cad_v/div_s if cad_v else 0):,.1f} {unit_s}", "#58a6ff", f"Periode: {_BOP_LATEST}")
                 with ck3: kpi_card("NERACA KESELURUHAN", f"{(ner_v/div_s if ner_v else 0):,.1f} {unit_s}", "#bc8cff", f"Periode: {_BOP_LATEST}")
 
-                # Fungsi Helper untuk Plotting SEKI
                 def gs(iid):
                     s = df_seki[df_seki["item_id"] == iid].copy()
                     s = s.sort_values("year" if f_val == "annual" else ["year","quarter"])
@@ -620,12 +619,10 @@ with tab5:
                     fig_pct.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0), xaxis=dict(type='category'))
                     st.plotly_chart(fig_pct, use_container_width=True)
 
-                # MENGEMBALIKAN TABEL DATA SEKI LENGKAP & TOMBOL DOWNLOAD
                 st.markdown("<hr style='margin: 10px 0;'>", unsafe_allow_html=True)
                 st.markdown("<div style='display: flex; justify-content: space-between; align-items: center;'>", unsafe_allow_html=True)
                 section_title("DATA LENGKAP NERACA PEMBAYARAN")
                 
-                # Filter Tabel
                 seki_tbl_filter = st.multiselect("Filter Indikator:", options=list(BOP_MAIN_ITEMS.values()), default=None, label_visibility="collapsed")
                 df_seki_table = df_seki.copy()
                 if seki_tbl_filter:
